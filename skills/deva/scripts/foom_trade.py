@@ -11,8 +11,9 @@ never read from an argument.
 
 `--key-file <path>` before the command uses another seed file (for example
 your payout key). `execute` talks to the FOOM connector over MCP with your Deva key, keeps a
-state file per proposal so a re-run never signs the same proposal twice, and
-only ever signs a transaction whose single signer and fee payer is your own
+state file per proposal so a re-run resends the transaction it already signed
+(it signs a replacement only after FOOM reports the earlier bytes cannot land),
+and only ever signs a transaction whose single signer and fee payer is your own
 trading key.
 """
 import base64
@@ -198,7 +199,7 @@ def need_seed():
         raise SystemExit(
             "ERROR: no trading key at %s. Run `python3 scripts/foom_trade.py keygen` "
             "first, then register the printed address as your trading wallet."
-            % KEY_PATH
+            % key_path()
         )
     return seed
 
@@ -211,7 +212,7 @@ def keygen():
             raise SystemExit(
                 "ERROR: %s exists but is not a usable key. Do not overwrite it blindly: "
                 "if a wallet was registered from it, its funds would be lost. Tell your human."
-                % KEY_PATH
+                % key_path()
             )
         directory = os.path.dirname(key_path())
         if directory:
@@ -222,7 +223,7 @@ def keygen():
             f.write(seed.hex() + "\n")
         print(
             "Created %s (keep it chmod 600, back it up, never print or commit it)."
-            % KEY_PATH
+            % key_path()
         )
     print("Trading wallet address: %s" % b58(pubkey(seed)))
     print(
@@ -542,12 +543,14 @@ def execute(proposal_id):
             "or pause the account and tell your human." % proposal_id
         )
     retried = False
+    earlier_code = None
     if status == "pending" or state is None:
         state, refusal = prepare_and_sign(proposal_id, seed, mine)
         state, refusal = _retry_prepare(proposal_id, seed, mine, state, refusal)
         if refusal is not None:
             return _stop_on(refusal, proposal_id)
         retried = state.get("_retried", False)
+        earlier_code = state.get("_earlier")
     else:
         print(
             "Resuming proposal %s with the transaction signed earlier; nothing is signed twice."
@@ -574,6 +577,7 @@ def execute(proposal_id):
             and not retried
         ):
             retried = True
+            earlier_code = code
             wait = refusal.get("retry_after_seconds")
             if (
                 code == "preparation_pending"
@@ -593,7 +597,7 @@ def execute(proposal_id):
                 proposal_id, seed, mine, state, refusal, allow=False
             )
             if refusal is not None:
-                return _stop_on(refusal, proposal_id)
+                return _stop_on(dict(refusal, _earlier=earlier_code), proposal_id)
             continue
         if code == "approval_used":
             print(
@@ -601,7 +605,7 @@ def execute(proposal_id):
                 "sent; reading the recorded status."
             )
             break
-        return _stop_on(refusal, proposal_id)
+        return _stop_on(dict(refusal, _earlier=earlier_code), proposal_id)
 
     sent = refusal is None
     status = need(executed, "status", TOOL_EXECUTE) if sent else "pending"
@@ -658,6 +662,9 @@ def _retry_prepare(proposal_id, seed, mine, state, refusal, allow=True):
     state, refusal = prepare_and_sign(proposal_id, seed, mine)
     if state is not None:
         state["_retried"] = True
+        state["_earlier"] = code
+    if refusal is not None:
+        refusal = dict(refusal, _earlier=code)
     return state, refusal
 
 
@@ -671,10 +678,31 @@ def _stop_on(refusal, proposal_id):
         )
         return 0
     if code in ("preparation_expired", "invalid_approval", "preparation_pending"):
+        earlier = refusal.get("_earlier")
+        answered = (
+            "%s twice" % code
+            if earlier in (None, code)
+            else "%s, then %s" % (earlier, code)
+        )
+        if code == "preparation_pending":
+            wait = refusal.get("retry_after_seconds")
+            raise SystemExit(
+                "ERROR: FOOM answered %s for proposal %s; the signing window kept closing. "
+                "FOOM relayed nothing from this run, but the earlier bytes it still tracks "
+                "may land. Run `python3 scripts/foom_trade.py execute %s` again "
+                "after %s s to read the proposal before you propose another trade. %s"
+                % (
+                    answered,
+                    proposal_id,
+                    proposal_id,
+                    wait if isinstance(wait, (int, float)) else "a few",
+                    message,
+                )
+            )
         raise SystemExit(
-            "ERROR: FOOM answered %s twice for proposal %s; the signing window kept closing. "
+            "ERROR: FOOM answered %s for proposal %s; the signing window kept closing. "
             "Nothing landed. Run this again, or pause the account and tell your human. %s"
-            % (code, proposal_id, message)
+            % (answered, proposal_id, message)
         )
     raise SystemExit(
         "ERROR: FOOM refused proposal %s with %s. %s" % (proposal_id, code, message)
@@ -691,18 +719,19 @@ def _refuse_key_arguments(argv):
         ):
             raise SystemExit(
                 "ERROR: this recipe never takes a key as an argument. Put the seed in %s "
-                "(hex, chmod 600) and run again." % KEY_PATH
+                "(hex, chmod 600) and run again." % key_path()
             )
 
 
 def main(argv):
     global KEY_FILE_OVERRIDE
-    _refuse_key_arguments(argv)
     if argv[:1] == ["--key-file"]:
         if len(argv) < 3:
             raise SystemExit("usage: foom_trade.py --key-file <path> <command> ...")
         KEY_FILE_OVERRIDE = argv[1]
         argv = argv[2:]
+    # The guard also sees the --key-file value, so a flag cannot hide there.
+    _refuse_key_arguments(([KEY_FILE_OVERRIDE] if KEY_FILE_OVERRIDE else []) + argv)
     if not argv:
         print(__doc__)
         return 1

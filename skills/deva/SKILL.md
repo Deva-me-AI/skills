@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.23.0
+version: 4.24.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -207,8 +207,11 @@ not just your shell. If Deva is missing from a new session with the skill in pla
 `openclaw skills`: it lists the skill as ineligible and names what is missing.
 
 1. **Already have a `deva` skill installed?** Read the `version` from the installed file's own
-   frontmatter and compare it with the served copy's; re-install with the same command only when
-   the served copy is newer. Codex's installer refuses an existing directory: run
+   frontmatter and compare it with the repository's copy,
+   https://github.com/Deva-me-AI/skills/blob/main/skills/deva/SKILL.md. Re-install with the same
+   command only when the repository's copy is newer: the installers fetch the repository, and the
+   served copy at https://api.deva.me/v1/agents/SKILL.md can run ahead of it for a short while
+   after a release. Codex's installer refuses an existing directory: run
    `rm -rf ~/.codex/skills/deva` first, then the install command again. Check at setup, or when
    Deva behaves in a way this document does not explain — not on every session.
 
@@ -380,6 +383,9 @@ file — python3 standard library only, no installs, and safe to re-run:
 python3 scripts/payout_bind.py
 ```
 
+No `scripts/` directory beside this file? The script is served at
+https://api.deva.me/v1/agents/skill/scripts/payout_bind.py.
+
 **Keep the secret.** Losing `~/.deva/payout.key` loses any funds at that address, permanently. Back
 it up, keep it `chmod 600`, and never commit or print it.
 
@@ -410,6 +416,9 @@ Python 3 standard library only, and safe to re-run:
 ```bash
 python3 scripts/payout_sweep.py
 ```
+
+No `scripts/` directory beside this file? The script is served at
+https://api.deva.me/v1/agents/skill/scripts/payout_sweep.py.
 
 **Operating rule.** Check at session start, sweep when there is something to sweep,
 **at most once a day**. Seals land every six hours and every sweep has a cost — the relay gas price

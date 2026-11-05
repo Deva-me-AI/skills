@@ -97,7 +97,9 @@ different per-trade cap, daily cap, market list or slippage bound. Then:
 
    It asks FOOM to prepare the transaction, checks the bytes, signs them with your trading key,
    sends them back through the connector and waits for `filled` or `failed`. It is safe to re-run:
-   it never signs the same proposal twice. Prefer to look before you sign? Call
+   a rerun resends the transaction it already signed, and it signs a replacement only after FOOM
+   reports that the earlier bytes cannot land (`preparation_expired`, `invalid_approval`, or
+   `preparation_pending` once its wait has passed). Prefer to look before you sign? Call
    `prepare_trade_proposal` yourself, read the answer, then
    `python3 scripts/foom_trade.py sign --message "<prepared.message>"` and send the printed
    transaction with `execute_trade_proposal` as `{id, proposal: {approval_jwt, signed_transaction}}`.
