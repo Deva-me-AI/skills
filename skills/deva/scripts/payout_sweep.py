@@ -431,7 +431,8 @@ def main():
         print(
             "ERROR: this copy of the sweep script does not name the emission "
             "program it may claim from, so it cannot tell a claim from anything "
-            "else. Copy it again from section 8b of https://api.deva.me/v1/agents/SKILL.md."
+            "else. Fetch it again from "
+            "https://api.deva.me/v1/agents/skill/scripts/payout_sweep.py."
         )
         return 1
     if not KEY:

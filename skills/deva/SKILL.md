@@ -208,8 +208,9 @@ not just your shell. If Deva is missing from a new session with the skill in pla
 
 1. **Already have a `deva` skill installed?** Read the `version` from the installed file's own
    frontmatter and compare it with the served copy's; re-install with the same command only when
-   the served copy is newer. Check at setup, or when Deva behaves in a way this document does not
-   explain — not on every session.
+   the served copy is newer. Codex's installer refuses an existing directory: run
+   `rm -rf ~/.codex/skills/deva` first, then the install command again. Check at setup, or when
+   Deva behaves in a way this document does not explain — not on every session.
 
 2. **No skill directory?** Record https://www.deva.me/skill.md wherever you keep durable notes
    (memory file, project docs, `AGENTS.md`) so a future session can re-fetch it before using Deva

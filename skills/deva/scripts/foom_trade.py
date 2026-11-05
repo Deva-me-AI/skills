@@ -63,7 +63,7 @@ SYSTEM_ASSIGN, SYSTEM_ASSIGN_WITH_SEED = 1, 10
 TRADING_WALLET_TEMPLATE = "deva-trading-wallet-v1:{persona_id}:{address}:{challenge}"
 KEY_FILE_OVERRIDE = None
 POLL_SECONDS = float(os.environ.get("FOOM_TRADE_POLL_SECONDS", "3"))
-MAX_WAIT_SECONDS = 180
+MAX_WAIT_SECONDS = float(os.environ.get("FOOM_TRADE_MAX_WAIT_SECONDS", "180"))
 
 # The dashboard substitutes the placeholder below; when you copied this from
 # the skill it is still a placeholder, so the key is read from your environment.
@@ -213,7 +213,9 @@ def keygen():
                 "if a wallet was registered from it, its funds would be lost. Tell your human."
                 % KEY_PATH
             )
-        os.makedirs(os.path.dirname(key_path()), mode=0o700, exist_ok=True)
+        directory = os.path.dirname(key_path())
+        if directory:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
         seed = os.urandom(32)
         fd = os.open(key_path(), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -601,8 +603,12 @@ def execute(proposal_id):
             break
         return _stop_on(refusal, proposal_id)
 
-    status = need(executed, "status", TOOL_EXECUTE) if refusal is None else "pending"
-    print("Sent. FOOM reports %s; waiting for it to settle." % status)
+    sent = refusal is None
+    status = need(executed, "status", TOOL_EXECUTE) if sent else "pending"
+    if sent:
+        print("Sent. FOOM reports %s; waiting for it to settle." % status)
+    else:
+        print("Waiting for FOOM to settle the bytes it already holds.")
     deadline = time.time() + MAX_WAIT_SECONDS
     while status not in TERMINAL_STATUSES and time.time() < deadline:
         time.sleep(POLL_SECONDS)
@@ -618,9 +624,18 @@ def execute(proposal_id):
         print("Proposal %s is %s." % (proposal_id, status))
         return 0
     print(
-        "Proposal %s is still %s after %d s. The transaction was sent; run this again later to "
-        "read the result (nothing will be signed twice)."
-        % (proposal_id, status, MAX_WAIT_SECONDS)
+        "Proposal %s is still %s after %d s. %s; run this again later to read the result "
+        "(nothing will be signed twice)."
+        % (
+            proposal_id,
+            status,
+            MAX_WAIT_SECONDS,
+            (
+                "The transaction was sent"
+                if sent
+                else "FOOM holds other bytes for this approval"
+            ),
+        )
     )
     return 0
 
