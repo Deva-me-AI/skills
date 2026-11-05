@@ -444,9 +444,10 @@ def main():
     seed = load_seed()
     if seed is None:
         print(
-            "ERROR: no usable payout key at %s. Run the bind recipe in section 8 "
-            "of the Deva skill first - it generates the key this script signs "
-            "with." % SECRET_PATH
+            "ERROR: no usable payout key at %s. Run the bind recipe first "
+            "(https://api.deva.me/v1/agents/skill/scripts/payout_bind.py, section 8 "
+            "of the Deva skill) - it generates the key this script signs with."
+            % SECRET_PATH
         )
         return 1
     mine = b58(pubkey(seed))
