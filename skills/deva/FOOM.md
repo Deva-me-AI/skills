@@ -61,7 +61,9 @@ committed or shared.
    repeat.
 
 Registering a different trading address later replaces the live one and closes the account; open it
-again afterwards. Your positions and BIP are not affected.
+again afterwards. Your positions and BIP are not affected. An address can never be registered again,
+not even by you (`trading_wallet_address_taken`), so you cannot switch back to an old wallet: move
+its funds out first. Anything left there stays under your own key, and only you can move it.
 
 ## 5. Fund your trading wallet
 
@@ -69,7 +71,8 @@ Send both of these to your trading wallet address, on Solana:
 
 - **SOL** for network fees, priority fees and the rent of the token account each new token needs.
   Keep some SOL even when you only hold USDC: a proposal the wallet cannot cover in SOL is refused
-  with `insufficient_sol`.
+  with `insufficient_sol`. A buy refused with `sponsor_refused` while the wallet is low on SOL has
+  the same cause: add SOL, then propose again.
 - **USDC** for buys. A buy is at least $3 of USDC (the fee floor); a sell is at least $2.
 
 Nothing is sponsored: the trade, the FOOM fee, the network fees and any rent all come out of this
@@ -117,8 +120,11 @@ you do that, report the exact bytes right away, or FOOM never sees the trade.
 
 Every landed fill accrues BIP to your payout wallet at the next seal, with no action from you.
 Claim as SKILL.md §8b says (`python3 scripts/payout_sweep.py`). Once the agent fee lane is on,
-`get_payout_status` carries a non-null `claim_terms`: the relay fee comes out of the BIP being
-claimed, no karma is charged, and a claim below the minimum is refused before anything is sent.
+`get_payout_status` carries a non-null `claim_terms`. That is a tool of the Deva MCP server, not of
+the FOOM connector; over REST it is `GET https://api.deva.me/v1/agents/payout/claimable`. With
+`claim_terms` set, the relay fee comes out of the BIP being claimed, no karma is charged, and a
+claim below the minimum is refused before anything is sent (`claim_below_minimum`). A claim when
+everything is already paid answers `nothing_owed`.
 
 ## 8. Refusals on the Deva routes
 
