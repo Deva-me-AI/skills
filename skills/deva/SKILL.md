@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.24.0
+version: 4.25.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -334,7 +334,7 @@ handle them, never crash:
 | `SDK_CREDITS_EXHAUSTED` (402) | wallet too low, or your cap exceeds spendable | `reason: "cap_preflight"`? retry once with `max_total_charge_credits ≤ max_allowed_cap_credits`. `reason: "cap_floor_above_balance"`? no cap can satisfy both the tool minimum and your balance — top up or pick a cheaper tool, don't retry. Otherwise: `get_balance` + top up your own wallet, or have a human claim and fund it |
 | `AGENT_KEY_EXPIRED` (403) | unfunded, unclaimed starter key older than 14 days | hand `claim_url` to a human — claiming revives the same key |
 | `sanctioned_address` (403) | every call on your key answers this: your agent is blocked | stop; resuming does not help and only delisting lifts it, so don't retry |
-| `sanctioned_address` (403) | a claim is refused because the payout address you are claiming to is on a sanctions list | claims refuse while the address is listed and other calls keep working; don't retry the claim |
+| `sanctioned_address` (403) | a claim is refused because the payout address you are claiming to is on a sanctions list | other calls keep working unless the sanctions sweep blocks your agent, and then the blocked-agent row above applies; don't retry the claim |
 | `SDK_RESOURCE_DISABLED` (403) | owner Rule disabled this tool | surface to owner; don't retry |
 | `SDK_RESOURCE_PER_CALL_CAP_EXCEEDED` / `SDK_RESOURCE_BUDGET_EXHAUSTED` (402) | owner Rule cap hit | surface to owner; don't retry |
 | `UPSTREAM_THROTTLED` (503) / `UPSTREAM_FAILED` (502) | provider error | retry once after a pause, then report |
@@ -473,14 +473,14 @@ payout key, which Deva never holds and cannot produce for you.
 
 - `{"code": "nothing_owed"}` (`409`) — everything committed has already been paid. A settled state,
   not a failure; on a karma lane the relayer refunds the gas for that submission. Match on `code`,
-  not on the status.
+  not on the status. An agent sweep that is already settled gets the same code in the array
+  envelope, `[{"error": "nothing_owed"}]`, before anything is sent.
 - `[{"error": "stale_sweep_epoch"}]` (`409`) — a seal landed between your read and this call.
   Nothing was spent. Re-read step 1 and prepare again; the amount waiting is **larger**, not lost,
   because a seal only ever adds to what you are owed. Note the envelope differs: an array with
   `error` here, an object with `code` above.
 - `[{"error": "claim_below_minimum"}]` (`409`) — agent sweeps only: what you are owed does not
-  clear the minimum yet (or is already settled when `claimable_now` is `"0"`). Nothing was sent;
-  rewards keep accumulating.
+  clear the minimum yet. Nothing was sent; rewards keep accumulating.
 - `[{"error": "claim_progress_unavailable"}]` (`503`) — agent sweeps only: the on-chain read did
   not answer, so the server could not price your sweep. Nothing was sent; retry later.
 - `{"code": "fee_exceeds_claim"}` (`409`) — the amount owed moved under your sweep and no longer

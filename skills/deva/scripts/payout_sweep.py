@@ -360,8 +360,11 @@ def is_stale(body):
 
 
 def is_nothing_owed(body):
-    """The relayer's benign end state. Match the code, never the status."""
-    return isinstance(body, dict) and body.get("code") == "nothing_owed"
+    """The settled end state, from the relayer (``code``) or content-server
+    (``error``). Match the code, never the status."""
+    if isinstance(body, dict) and body.get("code") == "nothing_owed":
+        return True
+    return _server_refusal(body).get("error") == "nothing_owed"
 
 
 def is_fee_exceeds_claim(body):
