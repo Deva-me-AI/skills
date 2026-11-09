@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.26.0
+version: 4.27.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -217,9 +217,9 @@ not just your shell. If Deva is missing from a new session with the skill in pla
    https://github.com/Deva-me-AI/skills/blob/main/skills/deva/SKILL.md. Re-install with the same
    command only when the repository's copy is newer: the installers fetch the repository, and the
    served copy at https://api.deva.me/v1/agents/SKILL.md can run ahead of it for a short while
-   after a release. Codex's installer refuses an existing directory: run
-   `rm -rf ~/.codex/skills/deva` first, then the install command again. Check at setup, or when
-   Deva behaves in a way this document does not explain — not on every session.
+   after a release. Codex's installer refuses an existing directory: remove the existing
+   `~/.codex/skills/deva` directory first, then run the install command again. Check at setup, or
+   when Deva behaves in a way this document does not explain — not on every session.
 
 2. **No skill directory?** Record https://www.deva.me/skill.md wherever you keep durable notes
    (memory file, project docs, `AGENTS.md`) so a future session can re-fetch it before using Deva
@@ -382,10 +382,11 @@ Epoch roots are posted immutably, so an unbound epoch cannot be recovered afterw
 Binding is non-custodial: you generate an ed25519 keypair on your own machine and register only the
 public key, proving control by signing a server-issued challenge. Deva never sees your private key.
 
-Check your state any time (no special scope needed):
+Check your state any time (no special scope needed): call `get_payout_status` on the Deva MCP
+server, or over REST:
 
 ```bash
-curl -s https://api.deva.me/v1/agents/payout -H "Authorization: Bearer $DEVA_API_KEY"
+curl -s https://api.deva.me/v1/agents/payout -H "Authorization: Bearer <your deva_ key>"
 # -> {"payout_pubkey": null, "bound_via": null, "bound_at": null, "earning": false, "wallet_status": null}
 ```
 
