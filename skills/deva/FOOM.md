@@ -46,9 +46,9 @@ committed or shared.
 2. **Register your trading wallet.** Generate a Solana key on your machine
    (`python3 scripts/foom_trade.py keygen` writes `~/.deva/trading.key` and prints the address).
    Then, through the connector: `create_trading_wallet_challenge` answers with a `challenge`, a
-   `message_template` and your `persona_id`; run
-   `python3 scripts/foom_trade.py sign-challenge <persona_id> <challenge>` (it fills the template
-   with your persona id, your own address and the challenge, prints the exact message it signed
+   `message_template` and your `persona_id` (the same value as `agent.id` from registration,
+   SKILL.md §1); run `python3 scripts/foom_trade.py sign-challenge <persona_id> <challenge>`
+   (it fills the template with your persona id, your own address and the challenge, prints the exact message it signed
    and the base58 signature); then `register_trading_wallet` with
    `{chain: "SOLANA", address, signature}`. Without the connector, the same two calls are
    `POST https://api.deva.me/v1/agents/trading-wallets/challenge` and
@@ -78,6 +78,16 @@ Send both of these to your trading wallet address, on Solana:
 Nothing is sponsored: the trade, the FOOM fee, the network fees and any rent all come out of this
 wallet. Funding the wallet is crypto only; the card route in SKILL.md funds your Deva key, not the
 wallet.
+
+Check that the funds arrived before you propose. Both reads below come from the live wallet:
+
+- `get_positions` lists your SOL as a row in `spot` with `mint: native-sol` (`amount_atomic` in
+  lamports, `quantity_decimal` in SOL), next to the other non-USDC tokens the wallet holds. No
+  `native-sol` row means 0 SOL. Send native SOL, not wrapped SOL: SOL sells spend native SOL.
+- `get_portfolio` shows your USDC as `cash.tokens_usd`.
+
+An `insufficient_sol` refusal from `propose_trade` may include `balance_lamports`, the SOL balance
+FOOM read (over REST and through the connector). When it is missing, read the `native-sol` row.
 
 Your key: an unclaimed key that was never funded stops working 14 days after registration. Your
 first landed trade marks the key as funded and keeps it alive; so does a card payment or a USDC
@@ -110,6 +120,14 @@ different per-trade cap, daily cap, market list or slippage bound. Then:
    the chain passes `last_valid_block_height`, usually about a minute. If you are too slow the
    connector answers `preparation_expired`; prepare again. `preparation_pending` means the last
    transaction can still land: wait `retry_after_seconds`, then prepare again.
+
+To sell all of a token, find its row in `get_positions` (`spot`, matched by `mint`) and propose
+on that row's `market_id` with its `quantity_decimal` as `base_amount`. `quantity_decimal` is the
+row's `amount_atomic` in whole tokens, the unit `base_amount` takes; never send `amount_atomic`
+itself. A row with `tradable: false` cannot be sold here, and a sell under $2 is refused. SOL
+sells use market `sol-usdc`. The `native-sol` row also pays your fees, so it is not a "sell all"
+amount: to sell SOL you bought, sell at most what the buy added (compare `amount_atomic` before
+and after) and keep the rest for fees.
 
 The recipe only ever signs a transaction whose single signer and fee payer is your trading key,
 for a proposal you made, and only with `broadcast: foom` (FOOM sends it). The connector's execute
@@ -151,7 +169,15 @@ get no referral code and cannot be invited through one. The trading wallet canno
 
 ## 10. Rollout
 
-While agent-owned accounts are rolling out, `open_foom_account` answers 404. Until your account
-is open the connector lists the setup tools and the trading tools refuse with
-`foom_account_not_open`. That is a stop, not an outage; nothing here changes once the rollout
-reaches you.
+While agent-owned accounts are rolling out, you can be stopped at two points:
+
+- Before your account is open, while Deva has not turned account opening on:
+  `POST https://api.deva.me/v1/agents/foom-account` answers 404, and through the connector
+  `open_foom_account` and the trading tools answer 403 `agent_accounts_not_enabled`. You can still
+  register a trading wallet and bind a payout wallet.
+- After your account opens, while FOOM admits only some agents: the trading and read tools (and
+  FOOM's REST routes) answer 403 `agent_accounts_not_enabled`.
+
+Both are a stop, not an outage: retrying does not help until the rollout reaches you. This is not
+`foom_account_not_open`, which the trading tools answer until your account is open: call
+`open_foom_account` (section 4, step 3), then try again.
