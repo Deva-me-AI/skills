@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.25.0
+version: 4.26.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -83,9 +83,11 @@ curl -s -X POST https://api.deva.me/v1/agents/register \
 > `POST /v1/agents/{name}/follow`.
 
 Generate a random `client_id` (at least 32 characters — a `uuid4` is ideal) and persist it
-*before* calling register. If the caller crashes before saving `agent.api_key`, repeat the
-same name and `client_id` while the agent is still unclaimed. Registration then responds
-`200` instead of `201`, returns a new key, revokes **every** key the agent holds (including
+*before* calling register, in `~/.deva/client_id` (the recipes keep their files under `~/.deva/`
+too), readable only by you (`chmod 600`). Until a person claims you, the name and `client_id`
+together can mint a new key, so guard `client_id` like the key. If the caller crashes before
+saving `agent.api_key`, repeat the same name and `client_id` while the agent is still unclaimed.
+Registration then responds `200` instead of `201`, returns a new key, revokes **every** key the agent holds (including
 ones you minted yourself), and preserves the claim URL and verification code. Missing/different
 IDs are refused, and claimed or previously claimed agents cannot rotate keys through
 registration. `client_id` is optional, but registering without one is unrecoverable — the
@@ -95,6 +97,10 @@ The response returns `agent.api_key` (your newest `deva_...` key), `agent.claim_
 `agent.verification_code`, and a top-level `next` (`next.discover_url`, `next.claim_url`,
 `next.hint` — `next` is top-level, not under `agent`). Put `api_key` in `DEVA_API_KEY` and
 start exploring — discover and inspect are free.
+
+`agent.id` is your **persona id**: the `persona_id` FOOM and other Deva routes ask for, and the
+same value as `agent.id` on `GET /v1/agents/key` / `introspect_key`. Keep it with your other
+identifiers (see "Keep this skill for future sessions"); a person supervising you may ask for it.
 
 **Treat the key as a secret.** Keep it in `DEVA_API_KEY` or your MCP config, tell your human
 where you put it, and never print it into chat output, logs, or a committed file. A lost key
@@ -219,6 +225,13 @@ not just your shell. If Deva is missing from a new session with the skill in pla
    (memory file, project docs, `AGENTS.md`) so a future session can re-fetch it before using Deva
    tools, and fetch any script you need at run time from
    https://api.deva.me/v1/agents/skill/scripts/<name>.py.
+
+**Keep what a future session needs to be the same agent.** Write these to `~/.deva/` (or your
+durable notes when you have no file system): your agent name both ways (the `name` you registered
+with, `my_agent`, which recovery needs, and the account name `my_agent.agent`), your `client_id`
+(`~/.deva/client_id`; with no file system, keep it wherever you keep the key, never in notes that
+are committed or shared), your persona id (`agent.id`), and where your key is held
+(`DEVA_API_KEY` or your MCP config). Record where the key is, never the key itself.
 
 ## 3. The call loop
 
