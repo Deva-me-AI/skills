@@ -96,12 +96,31 @@ purchase on Deva. Trade, or fund the key, before day 14.
 ## 6. Trade
 
 Read your limits first with `get_agent_limits`; change them with `set_agent_policy` if you want a
-different per-trade cap, daily cap, market list or slippage bound. Then:
+different per-trade cap, daily cap, market list or slippage bound.
+
+Before each proposal, read the market with `get_market` and decide on its `quote_status`:
+
+- `tradable`: FOOM verified this market recently. Propose.
+- `unknown`: FOOM could not verify it right now; `quote_status_reason` says why, for example
+  `jupiter_quote_rate_limited`. Propose anyway: the quote FOOM takes for your proposal decides.
+- `unavailable`: FOOM cannot open a trade on this market now (no route, or a perp whose openings
+  are disabled). Do not propose.
+
+`tradable` is `true` only when `quote_status` is `tradable`, so `tradable: false` alone is not a
+refusal. An older FOOM answers `tradable: false` without `quote_status`: read that as `unknown`.
+That rule is for `get_market` only. A row in `get_positions` with `tradable: false` is a token
+FOOM has no market for, and it cannot be sold here.
+
+Then:
 
 1. `propose_trade` with `venue: "spot"`, `order_type: "market"`, `side: "buy"` and
    `quote_amount` (USDC to spend) for a buy, or `side: "sell"` and `base_amount` for a sell, plus
-   a stable `idempotency_key`. Nobody approves it: the answer is your proposal id, status
-   `pending`.
+   an `idempotency_key`. Nobody approves it: the answer is your proposal id, status `pending`.
+   Reuse a key only to resend a request whose answer you never got; a key that was refused can
+   keep getting the same refusal, so after a refusal fix the cause and propose with a new key.
+   `rate_limited` or `quote_unavailable` means FOOM or its quote source is busy: wait
+   `retry_after_seconds` when the answer gives it, else about a minute, then propose again with a
+   new key.
 2. Execute it. The simplest way is one run of the recipe beside this file:
 
    ```bash
@@ -124,10 +143,13 @@ different per-trade cap, daily cap, market list or slippage bound. Then:
 To sell all of a token, find its row in `get_positions` (`spot`, matched by `mint`) and propose
 on that row's `market_id` with its `quantity_decimal` as `base_amount`. `quantity_decimal` is the
 row's `amount_atomic` in whole tokens, the unit `base_amount` takes; never send `amount_atomic`
-itself. A row with `tradable: false` cannot be sold here, and a sell under $2 is refused. SOL
-sells use market `sol-usdc`. The `native-sol` row also pays your fees, so it is not a "sell all"
-amount: to sell SOL you bought, sell at most what the buy added (compare `amount_atomic` before
-and after) and keep the rest for fees.
+itself. A row with `tradable: false` cannot be sold here, and a sell under $2 is refused.
+
+SOL is sold like any other token: the `native-sol` row carries `market_id: sol-usdc`. That row
+also pays your fees, so it is never a "sell all" amount: sell at most its `quantity_decimal`
+minus 0.01, which keeps about 0.01 SOL for fees and token-account rent. If that leaves nothing,
+or less than $2 worth, do not sell SOL. To sell SOL you bought, also sell no more than
+what the buy added (compare `amount_atomic` before and after).
 
 The recipe only ever signs a transaction whose single signer and fee payer is your trading key,
 for a proposal you made, and only with `broadcast: foom` (FOOM sends it). The connector's execute
