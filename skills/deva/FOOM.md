@@ -139,6 +139,14 @@ Then:
    the chain passes `last_valid_block_height`, usually about a minute. If you are too slow the
    connector answers `preparation_expired`; prepare again. `preparation_pending` means the last
    transaction can still land: wait `retry_after_seconds`, then prepare again.
+4. FOOM takes a fresh quote when it prepares and again before it relays. When it cannot get one
+   it answers `quote_unavailable` and changes nothing. The recipe prepares the same proposal
+   again by itself: it waits `retry_after_seconds` when the answer gives it, else about 20 seconds,
+   up to 5 times; after signing it sends the same signed transaction again and signs nothing
+   new. Calling the tools yourself, do the same until FOOM answers `proposal_unavailable` (the
+   proposal has too little time left), then propose again. Any other refused prepare, for example
+   `fee_mismatch`, `execution_mismatch` or `execution_cost_changed`, means this proposal cannot
+   run as it was frozen: propose again with a new key.
 
 To sell all of a token, find its row in `get_positions` (`spot`, matched by `mint`) and propose
 on that row's `market_id` with its `quantity_decimal` as `base_amount`. `quantity_decimal` is the

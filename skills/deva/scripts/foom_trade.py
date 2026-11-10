@@ -65,6 +65,18 @@ TRADING_WALLET_TEMPLATE = "deva-trading-wallet-v1:{persona_id}:{address}:{challe
 KEY_FILE_OVERRIDE = None
 POLL_SECONDS = float(os.environ.get("FOOM_TRADE_POLL_SECONDS", "3"))
 MAX_WAIT_SECONDS = float(os.environ.get("FOOM_TRADE_MAX_WAIT_SECONDS", "180"))
+# When FOOM cannot get a fresh quote it answers quote_unavailable and changes
+# nothing, so the same proposal is prepared again. FOOM's own wait is used when
+# it sends one; a wait longer than a minute is not sat out, since a proposal
+# only lives a few minutes.
+QUOTE_WAIT_SECONDS = float(os.environ.get("FOOM_TRADE_QUOTE_WAIT_SECONDS", "20"))
+MAX_QUOTE_WAIT_SECONDS = 60
+MAX_PREPARES = 5
+# Execute checks the quote again before it relays. The signed bytes only live
+# about a minute, so the resend waits are short and few.
+RESEND_WAIT_SECONDS = float(os.environ.get("FOOM_TRADE_RESEND_WAIT_SECONDS", "10"))
+MAX_RESEND_WAIT_SECONDS = 15
+MAX_RESENDS = 2
 
 # The dashboard substitutes the placeholder below; when you copied this from
 # the skill it is still a placeholder, so the key is read from your environment.
@@ -543,9 +555,10 @@ def execute(proposal_id):
             "or pause the account and tell your human." % proposal_id
         )
     retried = False
+    resends = 0
     earlier_code = None
     if status == "pending" or state is None:
-        state, refusal = prepare_and_sign(proposal_id, seed, mine)
+        state, refusal = _prepare_through_a_busy_quote(proposal_id, seed, mine)
         state, refusal = _retry_prepare(proposal_id, seed, mine, state, refusal)
         if refusal is not None:
             return _stop_on(refusal, proposal_id)
@@ -572,6 +585,19 @@ def execute(proposal_id):
         if refusal is None:
             break
         code = refusal.get("error")
+        if code == "quote_unavailable":
+            # FOOM refused before relaying anything, so the same signed bytes can go
+            # again. A wait longer than the bytes live is not sat out or cut short.
+            wait = _positive(refusal.get("retry_after_seconds"), RESEND_WAIT_SECONDS)
+            if resends >= MAX_RESENDS or wait > MAX_RESEND_WAIT_SECONDS:
+                return _stop_on(dict(refusal, _signed=True, _wait=wait), proposal_id)
+            resends += 1
+            print(
+                "FOOM could not get a fresh quote; sending the same signed transaction "
+                "again in %g s. Nothing is signed twice." % wait
+            )
+            time.sleep(wait)
+            continue
         if (
             code in ("preparation_expired", "invalid_approval", "preparation_pending")
             and not retried
@@ -644,6 +670,37 @@ def execute(proposal_id):
     return 0
 
 
+def _positive(value, default):
+    """A wait FOOM sent, when it is a positive number; else the default."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return default
+    return float(value)
+
+
+def _prepare_through_a_busy_quote(proposal_id, seed, mine):
+    """Prepare, and prepare again while FOOM cannot get a fresh quote.
+
+    Runs only before anything was signed for this proposal. FOOM ends it by
+    itself with proposal_unavailable once the proposal has too little time left.
+    """
+    tries = 0
+    while True:
+        tries += 1
+        state, refusal = prepare_and_sign(proposal_id, seed, mine)
+        if refusal is None or refusal.get("error") != "quote_unavailable":
+            return state, refusal
+        wait = _positive(refusal.get("retry_after_seconds"), QUOTE_WAIT_SECONDS)
+        if wait > MAX_QUOTE_WAIT_SECONDS:
+            return None, dict(refusal, _tries=tries, _long_wait=wait)
+        if tries >= MAX_PREPARES:
+            return None, dict(refusal, _tries=tries)
+        print(
+            "FOOM could not get a fresh quote (try %d of %d); preparing again in %g s."
+            % (tries, MAX_PREPARES, wait)
+        )
+        time.sleep(wait)
+
+
 def _retry_prepare(proposal_id, seed, mine, state, refusal, allow=True):
     """One more prepare when the first one was refused for a retryable reason."""
     if refusal is None or not allow:
@@ -677,6 +734,25 @@ def _stop_on(refusal, proposal_id):
             "left). Nothing was sent. Propose again. %s" % (proposal_id, message)
         )
         return 0
+    if code == "quote_unavailable" and refusal.get("_signed"):
+        raise SystemExit(
+            "ERROR: FOOM could not get a fresh quote for proposal %s and relayed nothing. The "
+            "signed transaction is kept: run `python3 scripts/foom_trade.py execute %s` again "
+            "in %g s to resend it (nothing will be signed twice). %s"
+            % (proposal_id, proposal_id, max(refusal.get("_wait") or 0, 60), message)
+        )
+    if code == "quote_unavailable" and refusal.get("_long_wait"):
+        raise SystemExit(
+            "ERROR: FOOM cannot quote proposal %s now and asks to wait %g s, longer than this "
+            "proposal can wait. Nothing was signed. Propose again after that wait. %s"
+            % (proposal_id, refusal["_long_wait"], message)
+        )
+    if code == "quote_unavailable" and refusal.get("_tries"):
+        raise SystemExit(
+            "ERROR: FOOM could not get a fresh quote for proposal %s after %d tries. Nothing was "
+            "signed. Wait a minute, then run this again while the proposal is still pending, or "
+            "propose again. %s" % (proposal_id, refusal["_tries"], message)
+        )
     if code in ("preparation_expired", "invalid_approval", "preparation_pending"):
         earlier = refusal.get("_earlier")
         answered = (
