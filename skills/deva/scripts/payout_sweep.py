@@ -13,12 +13,20 @@ import http.client
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
 API = "https://api.deva.me"
 SECRET_PATH = os.path.expanduser("~/.deva/payout.key")
 MAX_STALE_RETRIES = 2
+# BIP lives on the Bitplanet chain, not on Solana mainnet: a Solana RPC or
+# explorer will not find the sweep. After a submit the claimable read is asked
+# again, because the server reads claimed_total from the Bitplanet chain.
+CHAIN = "Bitplanet chain"
+CONFIRM_READS = 3
+CONFIRM_WAIT_SECONDS = 5
+CONFIRM_TIMEOUT_SECONDS = 10
 # The two lanes a prepare may answer with. On the fee lane the relay fee comes
 # out of the BIP being swept (no karma is charged), and the fee rides inside the
 # bytes you sign -- so this script checks it before signing.
@@ -271,7 +279,7 @@ def claim_in_message(raw, lane, mine):
     return claims[0]
 
 
-def call(method, path, body=None):
+def call(method, path, body=None, timeout=60):
     """Return (status, decoded_body). An HTTP error status is data, not a raise.
 
     The whole sweep turns on reading two different 409 bodies apart, so this
@@ -291,7 +299,7 @@ def call(method, path, body=None):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, _decode(r.read(), method, path)
     except urllib.error.HTTPError as e:
         try:
@@ -427,6 +435,64 @@ def fail(status, body, what):
         "ERROR: %s -> HTTP %s. %s%s\nNothing was swept."
         % (what, status, json.dumps(body)[:300], scope_hint)
     )
+
+
+def claimed_total_now(mine):
+    """The claimed total the server reads from the chain for ``mine``, or None.
+
+    A read naming another claimant (the wallet was re-bound meanwhile) says
+    nothing about this sweep, so it is not an answer.
+
+    The sweep is already submitted here, so a failed read is not reported with
+    call()'s "nothing was spent"; it only leaves the sweep unconfirmed.
+    """
+    try:
+        status, body = call(
+            "GET", "/v1/agents/payout/claimable", timeout=CONFIRM_TIMEOUT_SECONDS
+        )
+    except SystemExit:
+        return None
+    if status != 200 or not isinstance(body, dict):
+        return None
+    if body.get("claimant") != mine:
+        return None
+    cumulative = body.get("cumulative")
+    if not isinstance(cumulative, dict):
+        return None
+    claimed = cumulative.get("claimed_total")
+    try:
+        return None if claimed is None else int(claimed)
+    except (TypeError, ValueError):
+        return None
+
+
+def confirm_landed(committed, mine):
+    """Re-read the claimable state until claimed_total reaches what was swept.
+
+    A newer seal can raise claimable_now again right away, so the test is the
+    claimed total reaching the cumulative amount this sweep committed, not
+    claimable_now being 0.
+    """
+    for attempt in range(CONFIRM_READS):
+        if attempt:
+            time.sleep(CONFIRM_WAIT_SECONDS)
+        claimed = claimed_total_now(mine)
+        if claimed is not None and claimed >= committed:
+            print(
+                "Confirmed: this sweep landed. The claimable read now shows "
+                "claimed_total %s on the %s. Do not sweep again for it."
+                % (claimed, CHAIN)
+            )
+            return True
+    print(
+        "Not visible in the claimable read yet. Check again in a few minutes with "
+        "get_payout_status (or GET %s/v1/agents/payout/claimable): the sweep has "
+        "landed once cumulative.claimed_total reaches %s. Do not sweep again "
+        "before then, and do not look for it on Solana - it is on the %s. If "
+        "it still shows owed a day later, run this recipe again."
+        % (API, committed, CHAIN)
+    )
+    return False
 
 
 def main():
@@ -683,16 +749,22 @@ def main():
             # claim lands). Only claim a sweep happened when the response actually
             # names the transaction.
             print(
-                "Swept %s BIP base units against epoch %s, into %s."
-                % (swept, epoch_id, mine)
+                "Swept %s BIP base units against epoch %s, into %s on the %s."
+                % (swept, epoch_id, mine, CHAIN)
             )
-            print("Transaction: %s" % tx_signature)
+            print(
+                "Transaction: %s (on the %s, not Solana - a Solana RPC or "
+                "explorer will not find it)" % (tx_signature, CHAIN)
+            )
         else:
             print(
-                "Submitted - re-run later to confirm the balance moved. The "
-                "response did not name a transaction, so this run cannot prove "
-                "anything landed on chain."
+                "Submitted, but the response did not name a transaction, so this "
+                "run cannot prove anything landed on the %s yet." % CHAIN
             )
+        # The lines above must reach the agent even if a harness timeout
+        # kills this process during the confirmation reads below.
+        sys.stdout.flush()
+        confirm_landed(int(committed), mine)
         return 0
 
     if retry_reason == "lane":

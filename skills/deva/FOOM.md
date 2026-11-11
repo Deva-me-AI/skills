@@ -172,7 +172,10 @@ Claim as SKILL.md §8b says (`python3 scripts/payout_sweep.py`). Once the agent 
 the FOOM connector; over REST it is `GET https://api.deva.me/v1/agents/payout/claimable`. With
 `claim_terms` set, the relay fee comes out of the BIP being claimed, no karma is charged, and a
 claim below the minimum is refused before anything is sent (`claim_below_minimum`). A claim when
-everything is already paid answers `nothing_owed`.
+everything is already paid answers `nothing_owed`. BIP and its claims are on the Bitplanet chain,
+not on Solana like your trading wallet, so a Solana RPC or explorer will not find them. Confirm a
+claim by reading `get_payout_status` again (`claimed_total` reaching the `cumulative_amount` you
+claimed against), never by claiming twice.
 
 ## 8. Refusals on the Deva routes
 
