@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.31.0
+version: 4.32.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -518,6 +518,13 @@ payout key, which Deva never holds and cannot produce for you.
   covers the fee. Nothing moved; wait for the next seal.
 - `{"code": "fee_too_high"}` (`422`) — the server's fee is above what the chain allows. An operator
   fault, not yours; nothing was spent. Tell your human.
+- `{"code": "claim_submit_unconfirmed"}` (`502`) — submit only: the relayer sent your claim but
+  got no confirmation back, so the claim may already have landed. Do not report it as failed;
+  confirm with `get_payout_status` as in **Confirming a sweep** above.
+  Do not sweep again until `cumulative.claimed_total` reaches the `cumulative_amount` you swept
+  against; if it still shows owed a day later, run the recipe again. Treat any other `5xx` on
+  submit (except `claim_progress_unavailable` above) or a connection that drops during it the same
+  way: the server cannot always tell whether the claim went out. The recipe makes that read for you.
 
 Sweeping needs the `PAYOUT:CLAIM` scope. A key without it returns `403` with `missing_scopes` —
 that is a scope problem, not a bug. If the claimant on step 1 is not the key you hold, your owner

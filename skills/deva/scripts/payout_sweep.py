@@ -8,10 +8,13 @@ Safe to re-run: it exits quietly when there is nothing to sweep, and refuses to
 sign anything it did not recognise.
 """
 import base64
+import errno
 import hashlib
 import http.client
 import json
 import os
+import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -279,6 +282,22 @@ def claim_in_message(raw, lane, mine):
     return claims[0]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Hand a redirect back as the answer instead of following it: a failure on
+    the redirect target must never read as the submit itself not being sent."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_SUBMIT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class NotSent(SystemExit):
+    """The connection failed before any byte of the request left this machine
+    (refused, or the host name did not resolve): nothing reached the server."""
+
+
 def call(method, path, body=None, timeout=60):
     """Return (status, decoded_body). An HTTP error status is data, not a raise.
 
@@ -299,7 +318,12 @@ def call(method, path, body=None, timeout=60):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        opener = (
+            _SUBMIT_OPENER.open
+            if path.endswith("/claim/submit")
+            else urllib.request.urlopen
+        )
+        with opener(req, timeout=timeout) as r:
             return r.status, _decode(r.read(), method, path)
     except urllib.error.HTTPError as e:
         try:
@@ -308,9 +332,19 @@ def call(method, path, body=None, timeout=60):
             raw = b""
         try:
             return e.code, json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             return e.code, {"_raw": raw.decode("utf-8", "replace")[:300]}
     except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        reason = getattr(e, "reason", e)
+        if isinstance(
+            reason,
+            (ConnectionRefusedError, socket.gaierror, ssl.SSLCertVerificationError),
+        ) or getattr(reason, "errno", None) in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+            raise NotSent(
+                "ERROR: %s %s could not connect (%s). Nothing was sent and nothing "
+                "was spent. Retry later; if it persists, tell your human."
+                % (method, path, e)
+            )
         spent = (
             "The request may have reached the relayer and been charged before "
             "the connection dropped; the outcome is unknown."
@@ -327,7 +361,7 @@ def call(method, path, body=None, timeout=60):
 def _decode(payload, method, path):
     try:
         decoded = json.loads(payload)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise SystemExit(
             "ERROR: %s %s answered 2xx with a non-JSON body (%d bytes). A proxy, "
             "captive portal or WAF interstitial is probably answering instead of "
@@ -493,6 +527,22 @@ def confirm_landed(committed, mine):
         % (API, committed, CHAIN)
     )
     return False
+
+
+def confirm_unknown_submit(why, committed, mine):
+    """A submit that may have reached the chain without a 200: an answered 5xx
+    (the relayer's 502 ``claim_submit_unconfirmed`` broadcast the claim and
+    lost the confirmation) or a connection that dropped mid-request. Never
+    "Nothing was swept" and never a retry: read the claim state instead.
+    """
+    print(
+        "The submit %s, so the outcome is unknown: the claim may already have "
+        "landed on the %s. Not submitting again; reading the claimable state "
+        "instead." % (why, CHAIN)
+    )
+    sys.stdout.flush()
+    confirm_landed(committed, mine)
+    return 0
 
 
 def main():
@@ -711,15 +761,25 @@ def main():
                 "%s land in %s." % (prep.get("fee"), swept, mine)
             )
 
-        status, res = call(
-            "POST",
-            "/v1/agents/payout/claim/submit",
-            {
-                "epoch_id": epoch_id,
-                "recent_blockhash": blockhash,
-                "signature": sign(seed, raw).hex(),
-            },
-        )
+        try:
+            status, res = call(
+                "POST",
+                "/v1/agents/payout/claim/submit",
+                {
+                    "epoch_id": epoch_id,
+                    "recent_blockhash": blockhash,
+                    "signature": sign(seed, raw).hex(),
+                },
+            )
+        except NotSent:
+            raise
+        except SystemExit:
+            return confirm_unknown_submit(
+                "did not return a usable answer (the connection dropped, or "
+                "something other than the Deva API replied)",
+                int(committed),
+                mine,
+            )
         if status == 409 and is_stale(res):
             retry_reason = "stale"
             continue
@@ -735,6 +795,12 @@ def main():
         if status == 503 and is_progress_unavailable(res):
             print(PROGRESS_UNAVAILABLE_MESSAGE)
             return 0
+        if status >= 500 or 200 < status < 400:
+            return confirm_unknown_submit(
+                "answered HTTP %s %s" % (status, json.dumps(res)[:300]),
+                int(committed),
+                mine,
+            )
         if status != 200:
             fail(status, res, "POST /v1/agents/payout/claim/submit")
         tx_signature = None
