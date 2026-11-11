@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.30.0
+version: 4.31.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
