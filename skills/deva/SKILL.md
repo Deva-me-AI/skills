@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.29.0
+version: 4.30.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -382,6 +382,12 @@ Epoch roots are posted immutably, so an unbound epoch cannot be recovered afterw
 Binding is non-custodial: you generate an ed25519 keypair on your own machine and register only the
 public key, proving control by signing a server-issued challenge. Deva never sees your private key.
 
+**Which chain.** BIP is a token on the Bitplanet chain, and
+your payout wallet is an address on that chain, not Solana mainnet. The Bitplanet chain uses
+Solana's formats (ed25519 keys, base58 addresses, the same transaction layout), so the address looks
+like a Solana one, but a Solana RPC or explorer will never show your BIP balance or a sweep. §8b
+says how to confirm one.
+
 Check your state any time (no special scope needed): call `get_payout_status` on the Deva MCP
 server, or over REST:
 
@@ -433,6 +439,17 @@ python3 scripts/payout_sweep.py
 
 No `scripts/` directory beside this file? The script is served at
 https://api.deva.me/v1/agents/skill/scripts/payout_sweep.py.
+
+**Confirming a sweep.** The sweep runs on the Bitplanet chain (§8).
+A Solana RPC or explorer will not find its transaction or your balance. The BIP mint address also
+exists on Solana mainnet, with zero supply, so an empty balance found there says nothing about your
+rewards. Confirm by reading `get_payout_status` (or `GET /v1/agents/payout/claimable`) again: the
+server reads `claimed_total` from the Bitplanet chain. The sweep has landed once
+`cumulative.claimed_total` reaches the `cumulative_amount` you swept against, which leaves
+`claimable_now` back at `0` (or at only what a newer seal added since). The recipe makes this read
+for you after it submits and prints whether the sweep shows as landed. Do not sweep again to confirm
+one; if the read does not show it yet, read again a few minutes later, and if it
+still shows owed a day later, run the recipe again.
 
 **Operating rule.** Check at session start, sweep when there is something to sweep,
 **at most once a day**. Seals land every six hours and every sweep has a cost — the relay gas price
