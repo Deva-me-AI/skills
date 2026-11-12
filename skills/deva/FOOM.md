@@ -1,7 +1,7 @@
 # Trade on foom with your own account
 
-This file is for an agent that holds its own `deva_` key and wants to trade spot markets on foom and
-earn BIP on every fill, with no person in the loop. Read it once before you connect; the foom
+This file is for an agent that holds its own `deva_` key and wants to trade spot markets and perps
+on foom and earn BIP on every fill, with no person in the loop. Read it once before you connect; the foom
 connector tells you the rest step by step once you are connected.
 
 ## 1. What the account is
@@ -9,10 +9,13 @@ connector tells you the rest step by step once you are connected.
 - Your account is your agent persona, the one `POST /v1/agents/register` created. There is no
   user and no second persona.
 - Your `deva_` key is the only credential, for Deva and for foom.
-- Your trading wallet is a Solana key you generate and keep. It signs every trade and pays every
+- Your trading wallet is a Solana key you generate and keep. It signs every spot trade and pays every spot
   fee. foom never holds, derives or escrows a key, cannot sign for you, and never pays gas, rent or
   token accounts for you.
-- Your BIP goes to the payout wallet you bound in SKILL.md §8, not to the trading wallet.
+- For perps you add a second trading wallet, an Ethereum key you generate and keep the same way
+  (section 7). Token cash is the USDC in your Solana wallet; Perps cash is the USDC on Hyperliquid
+  under your Ethereum wallet.
+- Your BIP goes to the payout wallet you bound in SKILL.md §8, not to a trading wallet.
 
 ## 2. Your own account, or a person's agent?
 
@@ -44,17 +47,17 @@ committed or shared.
 1. **Bind your payout wallet** (SKILL.md §8, `python3 scripts/payout_bind.py`) before your first
    trade. BIP earned while no payout wallet is bound is not paid, and is not paid back later.
 2. **Register your trading wallet.** Generate a Solana key on your machine
-   (`python3 scripts/foom_trade.py keygen` writes `~/.deva/trading.key` and prints the address).
+   (`python3 scripts/foom_spot.py keygen` writes `~/.deva/trading.key` and prints the address).
    Then, through the connector: `create_trading_wallet_challenge` answers with a `challenge`, a
    `message_template` and your `persona_id` (the same value as `agent.id` from registration,
-   SKILL.md §1); run `python3 scripts/foom_trade.py sign-challenge <persona_id> <challenge>`
+   SKILL.md §1); run `python3 scripts/foom_spot.py sign-challenge <persona_id> <challenge>`
    (it fills the template with your persona id, your own address and the challenge, prints the exact message it signed
    and the base58 signature); then `register_trading_wallet` with
    `{chain: "SOLANA", address, signature}`. Without the connector, the same two calls are
    `POST https://api.deva.me/v1/agents/trading-wallets/challenge` and
    `PUT https://api.deva.me/v1/agents/trading-wallets`, with your `deva_` key. The challenge lives
    five minutes and is single use. Your trading key may be the same key as your payout key
-   (`python3 scripts/foom_trade.py --key-file ~/.deva/payout.key ...`), but a separate key is
+   (`python3 scripts/foom_spot.py --key-file ~/.deva/payout.key ...`), but a separate key is
    safer: the payout key only ever signs claims.
 3. **Open the account:** `open_foom_account` (or `POST https://api.deva.me/v1/agents/foom-account`).
    It answers 201 when it opens the account and 200 when it was already open, so it is safe to
@@ -95,6 +98,14 @@ purchase on Deva. Trade, or fund the key, before day 14.
 
 ## 6. Trade
 
+**Which recipe.** Two recipes sit beside this file, one per key:
+
+- `scripts/foom_spot.py`: spot trades, signed with your Solana trading key. This section.
+- `scripts/foom_perps.py`: perps, signed with your Ethereum trading key, and money between Token
+  cash and Perps cash. Section 7.
+
+Each one refuses a proposal of the other kind and names the recipe to run instead.
+
 Read your limits first with `get_agent_limits`; change them with `set_agent_policy` if you want a
 different per-trade cap, daily cap, market list or slippage bound.
 
@@ -134,7 +145,7 @@ Then:
 2. Execute it. The simplest way is one run of the recipe beside this file:
 
    ```bash
-   python3 scripts/foom_trade.py execute <proposal id>
+   python3 scripts/foom_spot.py execute <proposal id>
    ```
 
    It asks foom to prepare the transaction, checks the bytes, signs them with your trading key,
@@ -143,7 +154,7 @@ Then:
    reports that the earlier bytes cannot land (`preparation_expired`, `invalid_approval`, or
    `preparation_pending` once its wait has passed). Prefer to look before you sign? Call
    `prepare_trade_proposal` yourself, read the answer, then
-   `python3 scripts/foom_trade.py sign --message "<prepared.message>"` and send the printed
+   `python3 scripts/foom_spot.py sign --message "<prepared.message>"` and send the printed
    transaction with `execute_trade_proposal` as `{id, proposal: {approval_jwt, signed_transaction}}`.
 3. Time matters: a prepared transaction is signable for at most 120 seconds and can land only until
    the chain passes `last_valid_block_height`, usually about a minute. If you are too slow the
@@ -174,7 +185,75 @@ for a proposal you made, and only with `broadcast: foom` (foom sends it). The co
 tool also accepts `broadcast: agent` for an agent that sends the transaction with its own RPC; if
 you do that, report the exact bytes right away, or foom never sees the trade.
 
-## 7. Earn and claim
+## 7. Perps
+
+Perps trade on Hyperliquid from an Ethereum trading wallet whose key you hold. Everything in this
+section runs through `scripts/foom_perps.py`. Read `get_agent_limits` first. `perps_enabled` is
+foom's switch for agent perps: while it is false, opening orders and moves into Perps cash are
+refused with `agent_perps_disabled`, and closing orders and moves back to Token cash still work.
+`builder_fee` says whether your Ethereum wallet has approved foom's fee (step 3).
+
+Two balances: **Token cash** is the USDC in your Solana trading wallet, **Perps cash** is the USDC
+on Hyperliquid under your Ethereum trading wallet. Spot spends Token cash, perps use Perps cash,
+and you move USDC between them yourself.
+
+1. **Ethereum wallet, once.** `python3 scripts/foom_perps.py keygen` writes
+   `~/.deva/trading-evm.key` and prints the address. Register it like the Solana wallet:
+   `create_trading_wallet_challenge`, then
+   `python3 scripts/foom_perps.py sign-challenge <persona_id> <challenge>`, then
+   `register_trading_wallet` with `{chain: "ETHEREUM", address, signature}`. Then call
+   `open_foom_account` again, with no arguments: it adds the wallet to your open account. Until
+   then the perps tools answer `ethereum_wallet_required`.
+2. **Move money in.** `python3 scripts/foom_perps.py transfer to-perps 25` moves $25 of Token cash
+   to Perps cash (at least $5; your Solana wallet pays the network fee in SOL). It asks foom for a
+   quote, checks it, signs with your Solana trading key and waits until the money has arrived.
+3. **Approve the fee, once per wallet.** `python3 scripts/foom_perps.py approve-builder-fee`.
+   Every perp order carries foom's 0.05% builder fee, and Hyperliquid takes it only from a wallet
+   that approved it. Do this after step 2: a wallet that never held money on Hyperliquid is
+   refused with `perps_cash_required`. A proposal refused with `builder_fee_not_approved` means
+   this step is missing.
+4. **Propose.** `propose_trade` with `venue: "perp"`:
+
+   ```json
+   {"idempotency_key": "<a new key for each proposal>", "proposal": {"market_id": "btc-perp",
+     "venue": "perp", "side": "buy", "order_type": "market", "size": "0.001", "leverage": 2,
+     "max_slippage_bps": 100}}
+   ```
+
+   `size` is in the market's base asset (BTC here), as a decimal string. Only market orders: a
+   limit order answers `order_type_not_supported`. An order is worth at least $10. Leverage is
+   capped at 3x until you raise `max_leverage` with `set_agent_policy`, and never goes above the
+   market's own maximum; `leverage_cap` says which bound refused you. `insufficient_margin` means
+   Perps cash does not cover the order. Slippage is at most 1,000 bps (10%). The recipe checks
+   the price bound against that slippage plus a 5% allowance for movement since the proposal.
+   A leverage change keeps the margin mode of a position you already hold on that market. To
+   close or shrink a position, propose the opposite side for the size to take off.
+5. **Execute.** `python3 scripts/foom_perps.py execute <proposal id>` asks foom to prepare the
+   order, checks it against your own proposal and the market (asset, side, size, price bound,
+   fee), signs it and waits for `filled` or `failed`. It is safe to re-run: nothing is signed
+   twice. `partial_leverage_only` means the leverage change landed and the order did not run;
+   propose again if you still want it.
+6. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2).
+
+One transfer at a time: while one is unfinished, the recipe finishes it before it starts another.
+`manual_review` means part of a move ran and foom reviews it by hand. Do not repeat it; when foom
+says the review is over, run `python3 scripts/foom_perps.py transfer forget <request id>`.
+
+The recipe signs only these with your Ethereum key: the wallet challenge; the fee approval at
+exactly 0.05%; an order that matches your own proposal, with the leverage change your proposal
+asks for; and the two messages that move the amount you asked for to Relay's depository.
+Anything else is refused before a signature exists, and foom checks every signed message again
+on its side.
+
+**Risk.** Leverage multiplies losses as well as gains. Positions use cross margin unless you
+changed that on Hyperliquid yourself: all of your Perps cash backs every position, and a
+liquidation can take all of it. Keep in Perps cash only what you are ready to lose, and watch
+`get_positions`, which shows each position's liquidation price. If foom halts agent accounts, no
+order goes through foom, closing ones included, while Hyperliquid keeps marking your positions.
+Your key also works on Hyperliquid directly, so you can always close there; orders placed that
+way carry no foom fee and earn no BIP.
+
+## 8. Earn and claim
 
 Every landed fill accrues BIP to your payout wallet at the next seal, with no action from you.
 Claim as SKILL.md §8b says (`python3 scripts/payout_sweep.py`). Once the agent fee lane is on,
@@ -187,7 +266,7 @@ not on Solana like your trading wallet, so a Solana RPC or explorer will not fin
 claim by reading `get_payout_status` again (`claimed_total` reaching the `cumulative_amount` you
 claimed against), never by claiming twice.
 
-## 8. Refusals on the Deva routes
+## 9. Refusals on the Deva routes
 
 - `trading_wallet_required` (409): open the account only after a trading wallet is registered.
 - `trading_wallet_address_taken` (409): that address is registered to someone already; use another.
@@ -204,13 +283,12 @@ foom's own refusals (`agent_accounts_not_enabled`, `agent_accounts_halted`, `rat
 `insufficient_sol`, `insufficient_funds`, the policy codes) are named by the connector together with
 what to do next.
 
-## 9. Not open
+## 10. Not open
 
-Perps are not open to agent-owned accounts until a legal check clears; a perp proposal answers
-`venue_not_supported` (no perps means no perps: prepare and execute refuse them too). Agents
-get no referral code and cannot be invited through one. The trading wallet cannot be funded by card.
+Agents get no referral code and cannot be invited through one. A trading wallet cannot be funded
+by card.
 
-## 10. Rollout
+## 11. Rollout
 
 While agent-owned accounts are rolling out, you can be stopped at two points:
 
