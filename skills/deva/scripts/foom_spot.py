@@ -1,13 +1,16 @@
-"""Sign and execute a FOOM trade with your own trading key.
+"""Sign and execute a FOOM spot trade with your own Solana trading key.
 
-Ships beside SKILL.md in the Deva skill (scripts/foom_trade.py). Python 3
+Spot only. Perps, the Ethereum key and money between Token cash and Perps cash
+are scripts/foom_perps.py; `execute` here points a perp proposal at it.
+
+Ships beside SKILL.md in the Deva skill (scripts/foom_spot.py). Python 3
 standard library only. Your trading key never leaves this machine and is
 never read from an argument.
 
-    python3 scripts/foom_trade.py keygen                   # create ~/.deva/trading.key, print the address
-    python3 scripts/foom_trade.py sign-challenge <persona id> <challenge>   # wallet-challenge signature
-    python3 scripts/foom_trade.py sign --message "<b64>"   # signed transaction for a prepared message
-    python3 scripts/foom_trade.py execute <proposal id>    # prepare -> check -> sign -> execute -> wait
+    python3 scripts/foom_spot.py keygen                   # create ~/.deva/trading.key, print the address
+    python3 scripts/foom_spot.py sign-challenge <persona id> <challenge>   # wallet-challenge signature
+    python3 scripts/foom_spot.py sign --message "<b64>"   # signed transaction for a prepared message
+    python3 scripts/foom_spot.py execute <proposal id>    # prepare -> check -> sign -> execute -> wait
 
 `--key-file <path>` before the command uses another seed file (for example
 your payout key). `execute` talks to the FOOM connector over MCP with your Deva key, keeps a
@@ -209,7 +212,7 @@ def need_seed():
     seed = load_seed()
     if seed is None:
         raise SystemExit(
-            "ERROR: no trading key at %s. Run `python3 scripts/foom_trade.py keygen` "
+            "ERROR: no trading key at %s. Run `python3 scripts/foom_spot.py keygen` "
             "first, then register the printed address as your trading wallet."
             % key_path()
         )
@@ -534,6 +537,16 @@ def execute(proposal_id):
             "ERROR: FOOM refused to show proposal %s: %s"
             % (proposal_id, refusal.get("error"))
         )
+    # A perp proposal is signed with the Ethereum key, by the other recipe.
+    # An older foom sends no summary: that proposal is spot. Checked before the
+    # status, because a perp proposal has statuses of its own.
+    summary = proposal.get("summary")
+    if isinstance(summary, dict) and summary.get("venue") == "perp":
+        raise SystemExit(
+            "ERROR: %s is a perp proposal and this recipe trades spot only. Nothing was "
+            "signed. Run `python3 scripts/foom_perps.py execute %s` instead."
+            % (proposal_id, proposal_id)
+        )
     status = need(proposal, "status", TOOL_GET)
     if status in TERMINAL_STATUSES:
         clear_state(proposal_id)
@@ -737,7 +750,7 @@ def _stop_on(refusal, proposal_id):
     if code == "quote_unavailable" and refusal.get("_signed"):
         raise SystemExit(
             "ERROR: FOOM could not get a fresh quote for proposal %s and relayed nothing. The "
-            "signed transaction is kept: run `python3 scripts/foom_trade.py execute %s` again "
+            "signed transaction is kept: run `python3 scripts/foom_spot.py execute %s` again "
             "in %g s to resend it (nothing will be signed twice). %s"
             % (proposal_id, proposal_id, max(refusal.get("_wait") or 0, 60), message)
         )
@@ -765,7 +778,7 @@ def _stop_on(refusal, proposal_id):
             raise SystemExit(
                 "ERROR: FOOM answered %s for proposal %s; the signing window kept closing. "
                 "FOOM relayed nothing from this run, but the earlier bytes it still tracks "
-                "may land. Run `python3 scripts/foom_trade.py execute %s` again "
+                "may land. Run `python3 scripts/foom_spot.py execute %s` again "
                 "after %s s to read the proposal before you propose another trade. %s"
                 % (
                     answered,
@@ -803,7 +816,7 @@ def main(argv):
     global KEY_FILE_OVERRIDE
     if argv[:1] == ["--key-file"]:
         if len(argv) < 3:
-            raise SystemExit("usage: foom_trade.py --key-file <path> <command> ...")
+            raise SystemExit("usage: foom_spot.py --key-file <path> <command> ...")
         KEY_FILE_OVERRIDE = argv[1]
         argv = argv[2:]
     # The guard also sees the --key-file value, so a flag cannot hide there.
@@ -819,7 +832,7 @@ def main(argv):
     if command == "sign-challenge":
         if len(rest) != 2 or not all(rest) or any(":" in part for part in rest):
             raise SystemExit(
-                "usage: foom_trade.py sign-challenge <persona id> <challenge>  (the two values "
+                "usage: foom_spot.py sign-challenge <persona id> <challenge>  (the two values "
                 "the challenge call returned; the recipe fills the template with its own "
                 "address and never signs a free-form string)"
             )
@@ -836,7 +849,7 @@ def main(argv):
             message_b64 = sys.stdin.read().strip()
         else:
             raise SystemExit(
-                "usage: foom_trade.py sign [--message <base64>]  (or the message on stdin)"
+                "usage: foom_spot.py sign [--message <base64>]  (or the message on stdin)"
             )
         try:
             message = base64.b64decode(message_b64, validate=True)
@@ -847,7 +860,7 @@ def main(argv):
         return 0
     if command == "execute":
         if len(rest) != 1 or not rest[0]:
-            raise SystemExit("usage: foom_trade.py execute <proposal id>")
+            raise SystemExit("usage: foom_spot.py execute <proposal id>")
         return execute(rest[0])
     raise SystemExit(
         "unknown command %r; see the docstring at the top of this file." % command
