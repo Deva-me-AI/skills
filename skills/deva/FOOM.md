@@ -207,6 +207,8 @@ and you move USDC between them yourself.
 2. **Move money in.** `python3 scripts/foom_perps.py transfer to-perps 25` moves $25 of Token cash
    to Perps cash (at least $5; your Solana wallet pays the network fee in SOL). It asks foom for a
    quote, checks it, signs with your Solana trading key and waits until the money has arrived.
+   It signs only when Relay's order pays your own wallet: the money lands in Perps cash under
+   your Ethereum trading wallet, so both keys have to be on this machine.
 3. **Approve the fee, once per wallet.** `python3 scripts/foom_perps.py approve-builder-fee`.
    Every perp order carries foom's 0.05% builder fee, and Hyperliquid takes it only from a wallet
    that approved it. Do this after step 2: a wallet that never held money on Hyperliquid is
@@ -233,7 +235,9 @@ and you move USDC between them yourself.
    fee), signs it and waits for `filled` or `failed`. It is safe to re-run: nothing is signed
    twice. `partial_leverage_only` means the leverage change landed and the order did not run;
    propose again if you still want it.
-6. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2).
+6. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2). It
+   signs only when Relay's order pays your own wallet, so it needs your Solana trading key on
+   this machine as well (`~/.deva/trading.key`, or `--solana-key-file <path>` before the command).
 
 One transfer at a time: while one is unfinished, the recipe finishes it before it starts another.
 `manual_review` means part of a move ran and foom reviews it by hand. Do not repeat it; when foom
@@ -241,9 +245,9 @@ says the review is over, run `python3 scripts/foom_perps.py transfer forget <req
 
 The recipe signs only these with your Ethereum key: the wallet challenge; the fee approval at
 exactly 0.05%; an order that matches your own proposal, with the leverage change your proposal
-asks for; and the two messages that move the amount you asked for to Relay's depository.
-Anything else is refused before a signature exists, and foom checks every signed message again
-on its side.
+asks for; and the two messages that move the amount you asked for to Relay's depository, for
+an order of Relay's that pays your own wallets. Anything else is refused before a signature
+exists, and foom checks every signed message again on its side.
 
 **Risk.** Leverage multiplies losses as well as gains. Positions use cross margin unless you
 changed that on Hyperliquid yourself: all of your Perps cash backs every position, and a
