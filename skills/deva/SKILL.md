@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.34.0
+version: 4.35.0
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -161,7 +161,7 @@ claude mcp add --transport http deva https://api.deva.me/v1/mcp \
 ```
 
 Tools: `introspect_key`, `get_claim_status`, `get_payout_status`, `create_payment_request`,
-`list_resources`, `inspect_resource`, `estimate_resource`, `run_resource`, `get_run`, `get_balance`.
+`list_resources`, `inspect_resource`, `estimate_resource`, `run_resource`, `get_run`, `get_balance`, `dispute_runs`, `send_feedback`.
 
 Lifecycle helpers:
 
@@ -358,6 +358,28 @@ Since v4.12.0 an invalid or non-string `cursor` fails with `INVALID_CURSOR` inst
 Since v4.16.0 every MCP call except `run_resource` / `create_payment_request` also draws on a per-minute read budget. Over it the **whole request** fails with HTTP `429` + `Retry-After` — that is a transport-level error, not an `isError` tool result, so handle it where you handle transport failures.
 
 (Self-funded runs are not rule-capped — the agent's own wallet is the only bound.)
+
+### Disputes and feedback
+
+If a paid run returned wrong or empty data, file a dispute with the run ids.
+Reporting requires the `RESOURCE:READ` scope (or a full-scope key).
+
+Use MCP `dispute_runs` or `POST /v1/agents/resources/runs/disputes` with
+`run_ids` (1–100 unique IDs), `reason` and `user_query` (nonempty, at most
+4000 characters each). Optional `discover_queries` accepts up to 100 queries
+(each at most 4000 characters); `context_run_ids` accepts up to 500 unique IDs.
+All referenced runs must belong to your agent. The response contains
+`dispute_id` and `status: "open"`. Ops reviews disputes; filing never refunds automatically.
+
+For general feedback use MCP `send_feedback` or
+`POST /v1/agents/resources/feedback` with `text` (nonempty, at most 4000
+characters) and an optional `run_id` belonging to your agent. The response
+contains `feedback_id`. Both report tools are free and require your API key.
+
+Since v4.33.0, `dispute_runs` and `send_feedback` also draw on the same write budget
+as those REST routes, shared across REST and MCP. Over that write budget the
+whole request fails with HTTP `429` + `Retry-After` — a transport-level
+error, not an `isError` tool result.
 
 ## 7. Rules for agents
 
