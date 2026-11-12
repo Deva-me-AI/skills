@@ -18,7 +18,8 @@ messages that move Perps cash back. Each one is rebuilt here from its fields
 and checked before it is signed; no command signs a message or a hash you hand
 it. `transfer to-perps` is a Solana transaction, signed with the Solana key the
 spot recipe keeps (`--solana-key-file <path>` before the command reads another
-file).
+file). A transfer in either direction is signed only when Relay's order pays
+your own wallets, so both keys have to be on this machine for it.
 """
 import base64
 import contextlib
@@ -314,7 +315,7 @@ def _encode_field(kind, value, name):
         if not isinstance(value, (bytes, bytearray)) or len(value) != 32:
             _refuse("the field %s is not 32 bytes" % name)
         return bytes(value)
-    if kind in ("uint64", "uint256"):
+    if kind in ("uint32", "uint64", "uint256"):
         if isinstance(value, str) and value and all(c in _DIGITS for c in value):
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
@@ -346,6 +347,298 @@ def eip712_digest(domain, primary_type, fields, message):
         b"\x19\x01"
         + _struct_hash("EIP712Domain", _DOMAIN_FIELDS, domain)
         + _struct_hash(primary_type, fields, message)
+    )
+
+
+# Relay's order, as its settlement protocol types it. The id a wallet signs for a
+# transfer is the struct hash of this order, so the order says who is paid.
+RELAY_ORDER_TYPES = {
+    "Order": (
+        ("version", "string"),
+        ("solverChainId", "string"),
+        ("solver", "address"),
+        ("salt", "uint256"),
+        ("inputs", "Input[]"),
+        ("output", "Output"),
+        ("fees", "Fee[]"),
+    ),
+    "Input": (("payment", "InputPayment"), ("refunds", "InputRefund[]")),
+    "InputPayment": (
+        ("chainId", "string"),
+        ("currency", "bytes"),
+        ("amount", "uint256"),
+        ("weight", "uint256"),
+    ),
+    "InputRefund": (
+        ("chainId", "string"),
+        ("recipient", "bytes"),
+        ("currency", "bytes"),
+        ("minimumAmount", "uint256"),
+        ("deadline", "uint32"),
+        ("extraData", "bytes"),
+    ),
+    "Output": (
+        ("chainId", "string"),
+        ("payments", "OutputPayment[]"),
+        ("deadline", "uint32"),
+        ("calls", "bytes[]"),
+        ("extraData", "bytes"),
+    ),
+    "OutputPayment": (
+        ("recipient", "bytes"),
+        ("currency", "bytes"),
+        ("minimumAmount", "uint256"),
+        ("expectedAmount", "uint256"),
+    ),
+    "Fee": (
+        ("recipientChainId", "string"),
+        ("recipient", "bytes"),
+        ("currencyChainId", "string"),
+        ("currency", "bytes"),
+        ("amount", "uint256"),
+    ),
+}
+
+
+def _struct_refs(types, name, seen):
+    """Every struct type ``name`` refers to, directly or through another."""
+    for _, kind in types[name]:
+        base = kind[:-2] if kind.endswith("[]") else kind
+        if base in types and base not in seen:
+            seen.add(base)
+            _struct_refs(types, base, seen)
+    return seen
+
+
+def _type_text(types, name):
+    """EIP-712 encodeType: the type, then the structs it refers to, sorted by name."""
+
+    def one(t):
+        return "%s(%s)" % (t, ",".join("%s %s" % (kind, f) for f, kind in types[t]))
+
+    return one(name) + "".join(
+        one(t) for t in sorted(_struct_refs(types, name, set()) - {name})
+    )
+
+
+def _struct_word(types, kind, value, name):
+    """One 32-byte word of a struct that may hold structs, lists and bytes."""
+    if kind.endswith("[]"):
+        if not isinstance(value, list):
+            _refuse("the field %s is not a list" % name)
+        return keccak256(
+            b"".join(_struct_word(types, kind[:-2], v, name) for v in value)
+        )
+    if kind in types:
+        return hash_struct(types, kind, value)
+    if kind == "bytes":
+        if not isinstance(value, (bytes, bytearray)):
+            _refuse("the field %s is not bytes" % name)
+        return keccak256(bytes(value))
+    return _encode_field(kind, value, name)
+
+
+def hash_struct(types, primary_type, value):
+    """The EIP-712 struct hash of ``value`` (no domain), for the types given and no others."""
+    fields = types.get(primary_type) if isinstance(types, dict) else None
+    if not fields:
+        _refuse("the type %s is not one this recipe hashes" % primary_type)
+    names = [name for name, _ in fields]
+    if not isinstance(value, dict) or sorted(value) != sorted(names):
+        _refuse(
+            "the %s does not hold exactly the fields %s"
+            % (primary_type, ", ".join(names))
+        )
+    words = b"".join(
+        _struct_word(types, kind, value[name], "%s.%s" % (primary_type, name))
+        for name, kind in fields
+    )
+    return keccak256(keccak256(_type_text(types, primary_type).encode("utf-8")) + words)
+
+
+_ORDER_EVM_CHAINS = ("arbitrum", "base", "ethereum", "robinhood")
+
+
+def _order_part(value, type_name, what):
+    """One object of Relay's order: exactly the fields of its type."""
+    names = [name for name, _ in RELAY_ORDER_TYPES[type_name]]
+    if not isinstance(value, dict) or sorted(value) != sorted(names):
+        _refuse("%s does not hold exactly the fields %s" % (what, ", ".join(names)))
+    return value
+
+
+def _order_hex(value, what, most=None):
+    if (
+        not isinstance(value, str)
+        or value[:2] != "0x"
+        or len(value) % 2
+        or not all(c in _HEX for c in value[2:])
+    ):
+        _refuse("%s is not hex" % what)
+    raw = bytes.fromhex(value[2:])
+    if most is not None and len(raw) > most:
+        _refuse("%s is longer than %d bytes" % (what, most))
+    return raw
+
+
+def _order_address(value, chain, what):
+    """An address or a currency of the order, as the bytes its chain hashes."""
+    if chain == "solana":
+        try:
+            raw = b58decode(value)
+        except ValueError:
+            raw = b""
+        if len(raw) != 32:
+            _refuse("%s is not a Solana address" % what)
+        return raw
+    if chain == "hyperliquid":
+        raw = _order_hex(value, what, most=20)
+        if not raw:
+            _refuse("%s is empty" % what)
+        return raw
+    if chain in _ORDER_EVM_CHAINS:
+        raw = _order_hex(value, what)
+        if len(raw) != 20:
+            _refuse("%s is not a 20-byte address" % what)
+        return raw
+    _refuse("%s sits on a chain this recipe does not know (%r)" % (what, chain))
+
+
+def _order_amount(value, what):
+    if not isinstance(value, str) or not value or not all(c in _DIGITS for c in value):
+        _refuse("%s is not a whole number written in decimal" % what)
+    return int(value)
+
+
+def _order_deadline(value, what):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < 1 << 32
+    ):
+        _refuse("%s is not a time" % what)
+    return value
+
+
+def _order_list(value, what):
+    if not isinstance(value, list):
+        _refuse("%s is not a list" % what)
+    return value
+
+
+def relay_order_id(order):
+    """The id of one of Relay's orders: the struct hash of the order, 32 bytes.
+
+    The order arrives as JSON. Amounts are decimal text, the salt is hex, and an
+    address is written the way its own chain writes it; each is turned into the
+    value that is hashed, and anything that does not fit is refused.
+    """
+    order = _order_part(order, "Order", "Relay's order")
+    salt = _order_hex(order["salt"], "the order's salt", most=32)
+    if not salt:
+        _refuse("the order's salt is empty")
+    inputs = []
+    for item in _order_list(order["inputs"], "the order's inputs"):
+        item = _order_part(item, "Input", "an input of the order")
+        payment = _order_part(item["payment"], "InputPayment", "the order's payment")
+        refunds = []
+        for refund in _order_list(item["refunds"], "the order's refunds"):
+            refund = _order_part(refund, "InputRefund", "a refund of the order")
+            chain = refund["chainId"]
+            refunds.append(
+                {
+                    "chainId": chain,
+                    "recipient": _order_address(
+                        refund["recipient"], chain, "a refund's recipient"
+                    ),
+                    "currency": _order_address(
+                        refund["currency"], chain, "a refund's currency"
+                    ),
+                    "minimumAmount": _order_amount(
+                        refund["minimumAmount"], "a refund's minimum"
+                    ),
+                    "deadline": _order_deadline(
+                        refund["deadline"], "a refund's deadline"
+                    ),
+                    "extraData": _order_hex(
+                        refund["extraData"], "a refund's extra data"
+                    ),
+                }
+            )
+        inputs.append(
+            {
+                "payment": {
+                    "chainId": payment["chainId"],
+                    "currency": _order_address(
+                        payment["currency"],
+                        payment["chainId"],
+                        "the payment's currency",
+                    ),
+                    "amount": _order_amount(payment["amount"], "the payment's amount"),
+                    "weight": _order_amount(payment["weight"], "the payment's weight"),
+                },
+                "refunds": refunds,
+            }
+        )
+    output = _order_part(order["output"], "Output", "the order's output")
+    payments = []
+    for paid in _order_list(output["payments"], "the output's payments"):
+        paid = _order_part(paid, "OutputPayment", "a payment of the output")
+        payments.append(
+            {
+                "recipient": _order_address(
+                    paid["recipient"], output["chainId"], "the output's recipient"
+                ),
+                "currency": _order_address(
+                    paid["currency"], output["chainId"], "the output's currency"
+                ),
+                "minimumAmount": _order_amount(
+                    paid["minimumAmount"], "the output's minimum"
+                ),
+                "expectedAmount": _order_amount(
+                    paid["expectedAmount"], "the output's expected amount"
+                ),
+            }
+        )
+    fees = []
+    for fee in _order_list(order["fees"], "the order's fees"):
+        fee = _order_part(fee, "Fee", "a fee of the order")
+        fees.append(
+            {
+                "recipientChainId": fee["recipientChainId"],
+                "recipient": _order_address(
+                    fee["recipient"], fee["recipientChainId"], "a fee's recipient"
+                ),
+                "currencyChainId": fee["currencyChainId"],
+                "currency": _order_address(
+                    fee["currency"], fee["currencyChainId"], "a fee's currency"
+                ),
+                "amount": _order_amount(fee["amount"], "a fee's amount"),
+            }
+        )
+    return hash_struct(
+        RELAY_ORDER_TYPES,
+        "Order",
+        {
+            "version": order["version"],
+            "solverChainId": order["solverChainId"],
+            "solver": order["solver"],
+            "salt": int.from_bytes(salt, "big"),
+            "inputs": inputs,
+            "output": {
+                "chainId": output["chainId"],
+                "payments": payments,
+                "deadline": _order_deadline(
+                    output["deadline"], "the output's deadline"
+                ),
+                "calls": [
+                    _order_hex(call, "a call of the output")
+                    for call in _order_list(output["calls"], "the output's calls")
+                ],
+                "extraData": _order_hex(output["extraData"], "the output's extra data"),
+            },
+            "fees": fees,
+        },
     )
 
 
@@ -543,6 +836,20 @@ def b58(raw):
         n, r = divmod(n, 58)
         out = _ALPH[r] + out
     return "1" * (len(raw) - len(raw.lstrip(b"\x00"))) + out
+
+
+def b58decode(text):
+    """The bytes a base58 text stands for. Raises ValueError for anything else."""
+    if not isinstance(text, str) or not text:
+        raise ValueError("not base58")
+    n = 0
+    for c in text:
+        digit = _ALPH.find(c)
+        if digit < 0:
+            raise ValueError("not base58")
+        n = n * 58 + digit
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes(len(text) - len(text.lstrip("1"))) + body
 
 
 # --- the trading key ----------------------------------------------------------
@@ -995,7 +1302,14 @@ def _relay_request_id(value):
     return bytes.fromhex(value[2:])
 
 
-def transfer_out_digests(payload, amount_usd, mine):
+def _order_id_bytes(order_id):
+    """The id of the order that was checked: the 32 bytes relay_order_check returned."""
+    if not isinstance(order_id, (bytes, bytearray)) or len(order_id) != 32:
+        _refuse("the id of the checked order is not 32 bytes")
+    return bytes(order_id)
+
+
+def transfer_out_digests(payload, amount_usd, mine, order_id):
     """The two digests that move Perps cash back: Relay's authorization, then SendAsset.
 
     The money may only go to Relay's depository, in USDC, for the amount you asked.
@@ -1028,6 +1342,11 @@ def transfer_out_digests(payload, amount_usd, mine):
         or body["id"].lower() != str(mapping.get("id")).lower()
     ):
         _refuse("Relay's authorization signs another id than the one sent to Relay")
+    # And that id is the hash of the order that was checked: the order says who is paid.
+    if _order_id_bytes(order_id) != _relay_request_id(mapping.get("id")):
+        _refuse(
+            "Relay's authorization is for another order than the one that was checked"
+        )
 
     send = _object(payload.get("send_asset"), "the Hyperliquid transfer")
     message = _typed_message(
@@ -1094,6 +1413,112 @@ def transfer_out_digests(payload, amount_usd, mine):
     return (
         eip712_digest(_RELAY_DOMAIN, _MAPPING_TYPE, _MAPPING_FIELDS, mapping),
         eip712_digest(_USER_DOMAIN, _SEND_TYPE, _SEND_FIELDS, message),
+    )
+
+
+# Relay settles every order through its own solver, and an order between Token cash
+# and Perps cash has one shape: one payment in, one payment out, a refund on each side.
+RELAY_SOLVER = "0xf70da97812cb96acdf810712aa562db8dfa3dbef"
+RELAY_SOLVER_CHAIN = "base"
+RELAY_ORDER_VERSION = "v1"
+# What an order calls Perps cash: Hyperliquid's USDC, at eight decimals.
+HL_ORDER_USDC = "0x00000000000000000000000000000000"
+HL_ORDER_DECIMALS = 8
+
+
+def _order_atomic(amount_usd, decimals):
+    """Dollars as the whole number of units an order counts in, or None."""
+    amount = _plain_decimal(amount_usd)
+    if amount is None or amount <= 0:
+        return None
+    units = amount.scaleb(decimals)
+    return int(units) if units == units.to_integral_value() else None
+
+
+def relay_order_check(order, direction, amount_usd, mine_evm, mine_solana):
+    """Check that Relay's order pays your own wallets, and return its id.
+
+    Returns (order id, minimum paid out, expected paid out), the two amounts in
+    dollars. The order must be the plain one this recipe knows, settled by Relay's
+    solver, for the amount you asked, paying out to your own wallet on the other
+    side and refunding your own wallets on both.
+    """
+    if direction == "to-perps":
+        origin, target, decimals_in, decimals_out = (
+            "solana",
+            "hyperliquid",
+            SOLANA_USDC_DECIMALS,
+            HL_ORDER_DECIMALS,
+        )
+    elif direction == "to-cash":
+        origin, target, decimals_in, decimals_out = (
+            "hyperliquid",
+            "solana",
+            HL_ORDER_DECIMALS,
+            SOLANA_USDC_DECIMALS,
+        )
+    else:
+        _refuse("the direction of the transfer is not one this recipe knows")
+    # Hashing first checks every field's type and that no field is missing or extra.
+    order_id = relay_order_id(order)
+
+    def mine(chain, value):
+        if chain == "solana":
+            return value == mine_solana
+        return same_address(value, mine_evm)
+
+    def usdc(chain, value):
+        if chain == "solana":
+            return value == SOLANA_USDC_MINT
+        return value.lower() == HL_ORDER_USDC
+
+    if (
+        order["version"] != RELAY_ORDER_VERSION
+        or order["solverChainId"] != RELAY_SOLVER_CHAIN
+        or not same_address(order["solver"], RELAY_SOLVER)
+    ):
+        _refuse("Relay's order is not settled by Relay's own solver")
+    output = order["output"]
+    if (
+        len(order["inputs"]) != 1
+        or len(output["payments"]) != 1
+        or output["calls"]
+        or output["extraData"] != "0x"
+        or order["fees"]
+    ):
+        _refuse("Relay's order is not the plain one payment in, one payment out")
+    payment, refunds = order["inputs"][0]["payment"], order["inputs"][0]["refunds"]
+    if (
+        payment["chainId"] != origin
+        or not usdc(origin, payment["currency"])
+        or payment["weight"] != "1"
+    ):
+        _refuse("Relay's order does not take USDC from the side you are moving from")
+    asked = _order_atomic(amount_usd, decimals_in)
+    if asked is None or int(payment["amount"]) != asked:
+        _refuse("Relay's order is not for the %s you asked to move" % amount_usd)
+    if sorted(refund["chainId"] for refund in refunds) != ["hyperliquid", "solana"]:
+        _refuse("Relay's order does not hold one refund on each side")
+    for refund in refunds:
+        if (
+            not mine(refund["chainId"], refund["recipient"])
+            or not usdc(refund["chainId"], refund["currency"])
+            or refund["minimumAmount"] != "0"
+            or refund["extraData"] != "0x"
+        ):
+            _refuse("Relay's order would not refund your own wallet in USDC")
+    paid = output["payments"][0]
+    if (
+        output["chainId"] != target
+        or not mine(target, paid["recipient"])
+        or not usdc(target, paid["currency"])
+    ):
+        _refuse("Relay's order does not pay your own wallet in USDC on the other side")
+    scale = decimal.Decimal(10) ** decimals_out
+    return (
+        order_id,
+        decimal.Decimal(paid["minimumAmount"]) / scale,
+        decimal.Decimal(paid["expectedAmount"]) / scale,
     )
 
 
@@ -1188,7 +1613,7 @@ def _instructions_with_accounts(raw):
     ]
 
 
-def solana_transfer_message(payload, mine_solana, amount_usd):
+def solana_transfer_message(payload, mine_solana, amount_usd, order_id):
     """The message bytes of the Solana transaction that moves Token cash to Perps cash.
 
     Signed only when your key is the one signer and fee payer and the transaction
@@ -1239,6 +1664,9 @@ def solana_transfer_message(payload, mine_solana, amount_usd):
         _refuse(
             "the instruction is not a deposit of the %s USDC you asked for" % amount_usd
         )
+    # The deposit names the order it pays for: it must be the order that was checked.
+    if data[16:48] != _order_id_bytes(order_id):
+        _refuse("the deposit is for another order than the one that was checked")
     if len(accounts) != len(_RELAY_DEPOSIT_ACCOUNTS):
         _refuse(
             "the deposit names %d accounts, not %d"
@@ -1943,32 +2371,52 @@ def need_solana_seed():
     return seed
 
 
-def _sign_transfer(direction, amount_usd, payload):
-    """Check the quoted payload and sign it. Returns (submission, the signing address)."""
+def _sign_transfer(direction, amount_usd, payload, order):
+    """Check Relay's order and the quoted payload, then sign.
+
+    Returns (submission, the signing address, minimum paid out, expected paid out).
+    The order must pay your own wallets, and what is signed must carry its id.
+    """
+    solana_seed, evm_seed = need_solana_seed(), need_evm_seed()
+    mine_solana, mine_evm = b58(pubkey(solana_seed)), evm_address(evm_seed)
+    order_id, minimum, expected = relay_order_check(
+        order, direction, amount_usd, mine_evm, mine_solana
+    )
     if direction == "to-perps":
-        seed = need_solana_seed()
-        mine = b58(pubkey(seed))
-        message = solana_transfer_message(payload, mine, amount_usd)
-        return {
-            "kind": "relay_solana_transaction",
-            "signed_transaction": wire_transaction(seed, message),
-        }, mine
-    seed = need_evm_seed()
-    mine = evm_address(seed)
-    authorize, send_asset = transfer_out_digests(payload, amount_usd, mine)
+        message = solana_transfer_message(payload, mine_solana, amount_usd, order_id)
+        return (
+            {
+                "kind": "relay_solana_transaction",
+                "signed_transaction": wire_transaction(solana_seed, message),
+            },
+            mine_solana,
+            minimum,
+            expected,
+        )
+    authorize, send_asset = transfer_out_digests(
+        payload, amount_usd, mine_evm, order_id
+    )
     send = payload["send_asset"]
     return (
         {
             "kind": "relay_sendasset_out",
-            "authorize_signature": sig_hex(ecdsa_sign(seed, authorize)),
+            "authorize_signature": sig_hex(ecdsa_sign(evm_seed, authorize)),
             "send_asset": {
                 "action": send["action"],
-                "signature": sig_hex(ecdsa_sign(seed, send_asset)),
+                "signature": sig_hex(ecdsa_sign(evm_seed, send_asset)),
                 "nonce": send["nonce"],
             },
         },
-        mine,
+        mine_evm,
+        minimum,
+        expected,
     )
+
+
+def _dollars(amount):
+    """A dollar amount without trailing zeros: 24.50 reads 24.5."""
+    text = format(amount, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _signing_address(direction):
@@ -2031,11 +2479,29 @@ def _quote_and_sign(state):
                     "foom's quote sends the money to %r, not to your Ethereum trading "
                     "wallet %s" % (quote.get("destination_address"), mine)
                 )
-        submission, address = _sign_transfer(direction, amount, payload)
+        order = quote.get("relay_order")
+        if not isinstance(order, dict):
+            raise SystemExit(
+                "ERROR: foom's quote came without Relay's order, so the recipe cannot check "
+                "who this transfer pays. Nothing was signed. Run the transfer again for a "
+                "new quote."
+            )
+        submission, address, minimum, expected = _sign_transfer(
+            direction, amount, payload, order
+        )
     except SystemExit:
         # Refused before signing: nothing to resume.
         clear_state("transfer", "current")
         raise
+    paid_to = (
+        evm_address(need_evm_seed())
+        if direction == "to-perps"
+        else b58(pubkey(need_solana_seed()))
+    )
+    print(
+        "Relay's order pays your own wallet %s: at least $%s, expected $%s."
+        % (paid_to, _dollars(minimum), _dollars(expected))
+    )
     state.update(
         request_id=request_id,
         expires_at=quote.get("expires_at"),
@@ -2261,7 +2727,10 @@ def _transfer_locked(arguments):
             or -amount.as_tuple().exponent > SOLANA_USDC_DECIMALS
         ):
             raise SystemExit(TRANSFER_USAGE)
-        _signing_address(action)  # the key must exist before anything is asked of foom
+        # Both keys must be here before anything is asked of foom: one signs, and
+        # the other is the wallet Relay's order has to pay.
+        need_evm_seed()
+        need_solana_seed()
         state = {
             "direction": action,
             "amount_usd": value,
