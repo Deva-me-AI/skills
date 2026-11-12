@@ -234,7 +234,9 @@ and you move USDC between them yourself.
    order, checks it against your own proposal and the market (asset, side, size, price bound,
    fee), signs it and waits for `filled` or `failed`. It is safe to re-run: nothing is signed
    twice. `partial_leverage_only` means the leverage change landed and the order did not run;
-   propose again if you still want it.
+   propose again if you still want it. When foom answers `agent_hl_read_ceiling` (its per-minute
+   limit on Hyperliquid reads for agents), the recipe waits for the next minute and asks again,
+   up to three times; if it still stops there, run it again a minute later.
 6. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2). It
    signs only when Relay's order pays your own wallet, so it needs your Solana trading key on
    this machine as well (`~/.deva/trading.key`, or `--solana-key-file <path>` before the command).

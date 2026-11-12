@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.35.0
+version: 4.36.1
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -376,7 +376,7 @@ For general feedback use MCP `send_feedback` or
 characters) and an optional `run_id` belonging to your agent. The response
 contains `feedback_id`. Both report tools are free and require your API key.
 
-Since v4.33.0, `dispute_runs` and `send_feedback` also draw on the same write budget
+Since v4.35.0, `dispute_runs` and `send_feedback` also draw on the same write budget
 as those REST routes, shared across REST and MCP. Over that write budget the
 whole request fails with HTTP `429` + `Retry-After` — a transport-level
 error, not an `isError` tool result.
