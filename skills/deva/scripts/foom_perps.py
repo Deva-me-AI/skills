@@ -1783,7 +1783,9 @@ RESEND_WAIT_SECONDS = float(os.environ.get("FOOM_TRADE_RESEND_WAIT_SECONDS", "10
 MAX_RESEND_WAIT_SECONDS = 15
 MAX_RESENDS = 2
 MAX_READ_LIMIT_WAIT_SECONDS = 60
-MAX_READ_LIMIT_WAITS = 3
+MAX_READ_LIMIT_WAITS = (
+    3  # shared for the whole run: every early read and every prepare wait
+)
 
 # The dashboard substitutes the placeholder below; when you copied this from
 # the skill it is still a placeholder, so the key is read from your environment.
@@ -1914,34 +1916,38 @@ def refusal_text(refusal, doing):
     return text
 
 
-def _read_limit_wait(name, refusal, waits):
+def _read_limit_wait(name, refusal, read_positions):
     """The seconds to wait before asking again after foom's Hyperliquid read limit
-    refused name, printed on screen; None when the refusal is another one or the
-    waits are used up."""
+    refused name, printed on screen; None when the refusal is another one or this
+    run's whole wait budget (read_positions.waits, shared by every early read and
+    every prepare in the run) is used up."""
     if refusal is None or refusal.get("error") != "agent_hl_read_ceiling":
         return None
     wait = _positive(refusal.get("retry_after_seconds"), MAX_READ_LIMIT_WAIT_SECONDS)
-    if wait > MAX_READ_LIMIT_WAIT_SECONDS or waits >= MAX_READ_LIMIT_WAITS:
+    if (
+        wait > MAX_READ_LIMIT_WAIT_SECONDS
+        or read_positions.waits >= MAX_READ_LIMIT_WAITS
+    ):
         return None
+    read_positions.waits += 1
     print(
         "foom's limit on Hyperliquid reads for agents is reached for this minute; "
         "waiting %g s, then asking %s again (wait %d of %d)."
-        % (wait, name, waits + 1, MAX_READ_LIMIT_WAITS)
+        % (wait, name, read_positions.waits, MAX_READ_LIMIT_WAITS)
     )
     sys.stdout.flush()
     return wait
 
 
-def through_read_limit(name, arguments):
+def through_read_limit(name, arguments, read_positions):
     """Call a tool foom counts against its Hyperliquid read limit, waiting for the
-    next minute when the limit is reached. Returns (result, refusal) like mcp_call."""
-    waits = 0
+    next minute while this run's whole wait budget allows it. Returns (result,
+    refusal) like mcp_call."""
     while True:
         result, refusal = mcp_call(name, arguments)
-        wait = _read_limit_wait(name, refusal, waits)
+        wait = _read_limit_wait(name, refusal, read_positions)
         if wait is None:
             return result, refusal
-        waits += 1
         time.sleep(wait)
 
 
@@ -2072,21 +2078,31 @@ def _ended(proposal_id, status, already):
 
 
 class PositionsRead:
-    """get_positions for one prepare: read right before it, and again after any wait."""
+    """get_positions for one prepare: read right before it, and again after any wait.
+    One instance is shared for the whole run, so its wait budget (self.waits) is too.
+    """
 
     def __init__(self):
         self.kept = None
+        self.waits = 0
 
     def early(self):
         """The read before a prepare, which may wait for foom's read limit: nothing is
-        prepared yet. Only that limit stops the run here, since the prepare would be
-        refused by it too; any other refusal is read again if the plan changes leverage.
+        prepared yet. A refusal other than that limit is read once more; if it still
+        fails, the prepare goes ahead without it - the plan may turn out not to need
+        it at all, and if it does, the read taken after the prepare (``needed``)
+        decides then. Only a ceiling this run's wait budget cannot clear stops the
+        run here, unprepared, instead of preparing into a guaranteed ceiling refusal
+        on the read taken after it.
         """
-        if self.kept is None:
-            positions, refusal = through_read_limit(TOOL_POSITIONS, {})
+        if self.kept is not None:
+            return None
+        for _ in range(2):
+            positions, refusal = through_read_limit(TOOL_POSITIONS, {}, self)
             if refusal is None:
                 self.kept = positions
-            elif refusal.get("error") == "agent_hl_read_ceiling":
+                return None
+            if refusal.get("error") == "agent_hl_read_ceiling":
                 return dict(refusal, _positions="early")
         return None
 
@@ -2104,19 +2120,25 @@ class PositionsRead:
         self.kept = None
 
 
+def _may_change_leverage(summary):
+    """Whether to read positions before the prepare: every perp proposal except a
+    reduce-only exit, which is expected to only ever shrink a position. This only
+    decides whether to warm that read ahead of the prepare - the prepared plan is
+    checked for an actual leverage change afterward regardless."""
+    return summary.get("reduce_only") is not True
+
+
 def prepare_and_sign(proposal_id, seed, mine, summary, read_positions):
     """Ask foom for the plan, check it, sign it, and record the state before anything is sent."""
-    waits = 0
     while True:
-        if _is_int(summary.get("leverage")):
+        if _may_change_leverage(summary):
             refusal = read_positions.early()
             if refusal is not None:
                 return None, refusal
         prepared, refusal = mcp_call(TOOL_PREPARE, {"id": proposal_id})
-        wait = _read_limit_wait(TOOL_PREPARE, refusal, waits)
+        wait = _read_limit_wait(TOOL_PREPARE, refusal, read_positions)
         if wait is None:
             break
-        waits += 1
         time.sleep(wait)
         read_positions.forget()
     if refusal is not None:
@@ -2133,6 +2155,11 @@ def prepare_and_sign(proposal_id, seed, mine, summary, read_positions):
         )
     positions = None
     if "leverageAction" in plan or "leverageNonce" in plan:
+        if not _may_change_leverage(summary):
+            return None, {
+                "error": "reduce_only_leverage_change",
+                "_positions": "unsupported",
+            }
         positions, refusal = read_positions.needed()
         if refusal is not None:
             return None, refusal
@@ -2245,6 +2272,12 @@ def _stop_on(refusal, proposal_id, signed=False, sent=False):
             + refusal_text(refusal, "show your positions")
             + " The leverage change could not be checked against the position you hold."
         )
+    elif refusal.get("_positions") == "unsupported":
+        text = (
+            "ERROR: foom prepared a leverage change for an order it marked "
+            "reduce-only, so your positions were not read before the prepare and "
+            "cannot be read in time to check it."
+        )
     elif refusal.get("_positions"):
         text = "ERROR: " + refusal_text(refusal, "show your positions")
     else:
@@ -2268,6 +2301,11 @@ def _stop_on(refusal, proposal_id, signed=False, sent=False):
         )
     elif refusal.get("_positions") == "early":
         text += " Nothing was signed. Run this again in a minute."
+    elif refusal.get("_positions") == "unsupported":
+        text += (
+            " Nothing was signed. To close or shrink the position, propose it again"
+            " without a leverage value, which keeps the current setting."
+        )
     elif refusal.get("_positions"):
         text += " Nothing was signed. Run this again."
     else:
