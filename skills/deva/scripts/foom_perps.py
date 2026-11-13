@@ -2090,8 +2090,9 @@ class PositionsRead:
         """The read before a prepare, which may wait for foom's read limit: nothing is
         prepared yet. A refusal other than that limit is read once more; if it still
         fails, the prepare goes ahead without it - the plan may turn out not to need
-        it at all, and if it does, the read taken after the prepare (``needed``)
-        decides then. Only a ceiling this run's wait budget cannot clear stops the
+        it at all. If it does, the read taken after the prepare (``needed``) never
+        waits and lands in the prepare's minute, so a ceiling there stops the run
+        unsigned. Only a ceiling this run's wait budget cannot clear stops the
         run here, unprepared, instead of preparing into a guaranteed ceiling refusal
         on the read taken after it.
         """
@@ -2122,9 +2123,10 @@ class PositionsRead:
 
 def _may_change_leverage(summary):
     """Whether to read positions before the prepare: every perp proposal except a
-    reduce-only exit, which is expected to only ever shrink a position. This only
-    decides whether to warm that read ahead of the prepare - the prepared plan is
-    checked for an actual leverage change afterward regardless."""
+    reduce-only exit, which is expected to only ever shrink a position. When this
+    is False, a prepared plan that still carries a leverage change is refused
+    (``reduce_only_leverage_change``) without reading positions after the prepare:
+    no early read exists to check it against."""
     return summary.get("reduce_only") is not True
 
 
@@ -2306,6 +2308,8 @@ def _stop_on(refusal, proposal_id, signed=False, sent=False):
             " Nothing was signed. To close or shrink the position, propose it again"
             " without a leverage value, which keeps the current setting."
         )
+    elif refusal.get("_positions") and code == "agent_hl_read_ceiling":
+        text += " Nothing was signed. Run this again in a minute."
     elif refusal.get("_positions"):
         text += " Nothing was signed. Run this again."
     else:
