@@ -9,15 +9,28 @@ never read from an argument.
 
     python3 scripts/foom_spot.py keygen                   # create ~/.deva/trading.key, print the address
     python3 scripts/foom_spot.py sign-challenge <persona id> <challenge>   # wallet-challenge signature
-    python3 scripts/foom_spot.py sign --message "<b64>"   # signed transaction for a prepared message
+    python3 scripts/foom_spot.py sign <proposal id>       # prepare -> check -> sign, print execute's arguments
     python3 scripts/foom_spot.py execute <proposal id>    # prepare -> check -> sign -> execute -> wait
 
 `--key-file <path>` before the command uses another seed file (for example
 your payout key). `execute` talks to the FOOM connector over MCP with your Deva key, keeps a
 state file per proposal so a re-run resends the transaction it already signed
-(it signs a replacement only after FOOM reports the earlier bytes cannot land),
-and only ever signs a transaction whose single signer and fee payer is your own
-trading key.
+(it signs a replacement only after FOOM reports the earlier bytes cannot land).
+
+Before it signs, the recipe checks the prepared transaction against your own
+proposal (get_proposal's summary) and the market's mint and decimals
+(get_market): your trading key is the only signer and the fee payer; the one
+swap is a Jupiter route between your own token accounts for that market, for
+exactly the proposal's amount, with no slippage beyond the floor written into
+it; that floor is within max_slippage_bps plus 5% of quote_usd when the market
+price is live; foom's fee is one USDC transfer from your own USDC account of at
+most the larger of $0.95 and 2% of the trade; the priority fee is at most
+FOOM_TRADE_MAX_PRIORITY_LAMPORTS (5,000,000 lamports unless set); at most 4
+token accounts are opened, each your own; wrapped SOL moves only between your
+wallet and its own wrapped SOL account; and the swap's owner, source and
+destination, foom's fee source and recipient, and every account of yours that
+sends or receives SOL or closes are written in the transaction itself, not read
+from a lookup table. Anything else is refused before a signature exists.
 """
 import base64
 import hashlib
@@ -28,11 +41,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from fractions import Fraction
 
 MCP = "https://foomfamily.ai/mcp"
 TOOL_GET = "get_proposal"
 TOOL_PREPARE = "prepare_trade_proposal"
 TOOL_EXECUTE = "execute_trade_proposal"
+TOOL_MARKET = "get_market"
 # What a prepare answer must carry, and the statuses FOOM reports. Pinned by
 # a contract test on the server side: a change on FOOM's side changes this
 # recipe and bumps the skill version.
@@ -50,18 +65,31 @@ PROPOSAL_STATUSES = (
 TERMINAL_STATUSES = ("filled", "failed", "rejected", "expired", "cancelled")
 KEY_PATH = "~/.deva/trading.key"
 STATE_DIR = "~/.deva/foom-trade"
-# A swap moves tokens; it never delegates them or hands a token account to
-# someone else. A top-level Approve, ApproveChecked or SetAuthority from either
-# token program is refused before signing, whatever else the message carries.
-TOKEN_PROGRAMS = (
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # pragma: allowlist secret
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # pragma: allowlist secret
+TOKEN_PROGRAM = (
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"  # pragma: allowlist secret
 )
-TOKEN_APPROVE, TOKEN_SET_AUTHORITY, TOKEN_APPROVE_CHECKED = 4, 6, 13
-# A trade never changes who owns your wallet account either: a System program
-# Assign / AssignWithSeed that names your key is refused.
+TOKEN_2022_PROGRAM = (
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"  # pragma: allowlist secret
+)
+ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"  # pragma: allowlist secret
+COMPUTE_BUDGET_PROGRAM = "ComputeBudget111111111111111111111111111111"
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
-SYSTEM_ASSIGN, SYSTEM_ASSIGN_WITH_SEED = 1, 10
+JUPITER_PROGRAM = (
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"  # pragma: allowlist secret
+)
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # pragma: allowlist secret
+WSOL_MINT = "So11111111111111111111111111111111111111112"  # pragma: allowlist secret
+ROUTE_V2 = bytes([187, 100, 250, 204, 49, 196, 175, 20])
+SHARED_ROUTE_V2 = bytes([209, 152, 83, 147, 124, 254, 216, 233])
+USDC_DECIMALS = 6
+MAX_FEE_FLOOR_ATOMIC = 950_000
+MAX_FEE_BPS = 200
+MAX_PRIORITY_LAMPORTS = "5000000"
+MAX_COMPUTE_UNITS = 1_400_000
+MAX_TOKEN_ACCOUNTS = 4
+MAX_PLATFORM_FEE_BPS = 50
+MAX_SLIPPAGE_BPS = 500
+PRICE_MARGIN_BPS = 500
 # The trading-wallet challenge template, filled with the persona id, this
 # key's address and the challenge; the recipe never signs a free-form string.
 TRADING_WALLET_TEMPLATE = "deva-trading-wallet-v1:{persona_id}:{address}:{challenge}"
@@ -293,34 +321,37 @@ def keygen():
 def _shortvec(raw, i):
     """Decode the compact-u16 at ``raw[i:]``; return (value, next index)."""
     value = 0
-    for shift in (0, 7, 14):
+    for n, shift in enumerate((0, 7, 14)):
         byte = raw[i]
         i += 1
         value |= (byte & 0x7F) << shift
         if not byte & 0x80:
+            if n and not byte:
+                raise ValueError("a compact length that is not in its shortest form")
+            if n == 2 and byte > 3:
+                raise ValueError("a compact length above 65535")
             return value, i
     raise ValueError("compact-u16 runs longer than three bytes")
 
 
 def parse_message(raw):
-    """The static keys, required signatures and top-level instructions of a message.
+    """The header, static keys and top-level instructions of a message.
 
-    Accepts a legacy message and a version 0 message (first byte 0x80, then the
-    same header, static accounts, blockhash and instructions, followed by the
-    address-table lookups). Every byte must be accounted for: bytes the parser
-    did not read are not a transaction it can vouch for.
+    Accepts a legacy message and a version 0 message. Every byte must be
+    accounted for, and every account an instruction names must exist.
     """
     i = 0
-    if raw and raw[0] & 0x80:
+    versioned = bool(raw) and bool(raw[0] & 0x80)
+    if versioned:
         if raw[0] & 0x7F:
             raise ValueError("a transaction version this recipe does not know")
         i = 1
     if len(raw) < i + 3:
         raise ValueError("too short to be a message")
-    required = raw[i]
+    header = tuple(raw[i : i + 3])
     i += 3
     count, i = _shortvec(raw, i)
-    if not required or required > count or len(raw) < i + count * 32 + 32:
+    if not count or len(raw) < i + count * 32 + 32:
         raise ValueError("account table does not fit inside the message")
     keys = [b58(raw[i + n * 32 : i + (n + 1) * 32]) for n in range(count)]
     i += count * 32 + 32
@@ -330,14 +361,16 @@ def parse_message(raw):
         program = raw[i]
         i += 1
         accounts, i = _shortvec(raw, i)
+        indexes = list(raw[i : i + accounts])
         i += accounts
         length, i = _shortvec(raw, i)
-        data = raw[i : i + length]
+        data = bytes(raw[i : i + length])
         i += length
         if i > len(raw) or program >= count:
             raise ValueError("an instruction runs past the end of the message")
-        instructions.append((keys[program], data))
-    if raw[0] & 0x80:
+        instructions.append((program, indexes, data))
+    loaded = 0
+    if versioned:
         tables, i = _shortvec(raw, i)
         for _ in range(tables):
             i += 32
@@ -345,58 +378,404 @@ def parse_message(raw):
             i += writable
             readonly, i = _shortvec(raw, i)
             i += readonly
+            loaded += writable + readonly
             if i > len(raw):
                 raise ValueError(
                     "an address-table lookup runs past the end of the message"
                 )
     if i != len(raw):
         raise ValueError("%d bytes follow the message" % (len(raw) - i))
-    return keys, required, instructions
-
-
-def check_message(raw, mine):
-    """Refuse anything but a transaction this key alone signs and pays for."""
-    try:
-        keys, required, instructions = parse_message(raw)
-    except (IndexError, ValueError) as error:
-        raise SystemExit(
-            "ERROR: refusing to sign - the prepared message carries %s. Nothing was signed. "
-            "Prepare again; if it repeats, tell your human." % error
+    if any(a >= count + loaded for _, indexes, _ in instructions for a in indexes):
+        raise ValueError(
+            "an instruction that names an account the message does not hold"
         )
-    if required != 1:
-        raise SystemExit(
-            "ERROR: refusing to sign - the message wants %d signatures, not just yours. "
-            "Nothing was signed. Tell your human." % required
+    return header, keys, instructions
+
+
+def _is_code(text):
+    return 0 < len(text) <= 64 and all(c == "_" or "a" <= c <= "z" for c in text)
+
+
+def _refuse(why):
+    raise SystemExit(
+        "ERROR: refusing to sign - %s. Nothing was signed. Prepare again; if it repeats, "
+        "tell your human." % why
+    )
+
+
+def _b58decode(text):
+    n = 0
+    for char in text:
+        n = n * 58 + _ALPH.index(char)
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\x00" * (len(text) - len(text.lstrip("1"))) + body
+
+
+def is_address(value):
+    if not isinstance(value, str) or not 32 <= len(value) <= 44:
+        return False
+    if any(char not in _ALPH for char in value):
+        return False
+    return len(_b58decode(value)) == 32 and b58(_b58decode(value)) == value
+
+
+def on_curve(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    x2 = (y * y - 1) * pow(_d * y * y + 1, _p - 2, _p) % _p
+    x = pow(x2, (_p + 3) // 8, _p)
+    if (x * x - x2) % _p:
+        x = x * _sq % _p
+    return (x * x - x2) % _p == 0
+
+
+_DERIVED = {}
+
+
+def associated_token_account(owner, mint):
+    if (owner, mint) not in _DERIVED:
+        seeds = _b58decode(owner) + _b58decode(TOKEN_PROGRAM) + _b58decode(mint)
+        program = _b58decode(ATA_PROGRAM)
+        for bump in range(255, -1, -1):
+            candidate = hashlib.sha256(
+                seeds + bytes([bump]) + program + b"ProgramDerivedAddress"
+            ).digest()
+            if not on_curve(candidate):
+                _DERIVED[(owner, mint)] = b58(candidate)
+                break
+        else:
+            _refuse("no token account can be derived for %s" % mint)
+    return _DERIVED[(owner, mint)]
+
+
+def _atomic(text, decimals, what):
+    if not isinstance(text, str) or not text or len(text) > 60:
+        _refuse("the proposal's %s is not a decimal amount" % what)
+    whole, _, fraction = text.partition(".")
+    digits = "0123456789"
+    if (
+        not whole
+        or any(c not in digits for c in whole + fraction)
+        or text.endswith(".")
+    ):
+        _refuse("the proposal's %s is not a decimal amount" % what)
+    if len(fraction.rstrip("0")) > decimals:
+        _refuse("the proposal's %s has more decimals than the token" % what)
+    value = int(whole) * 10**decimals + int(
+        (fraction + "0" * decimals)[:decimals] or "0"
+    )
+    if not 0 < value < 2**64:
+        _refuse("the proposal's %s is out of range" % what)
+    return value
+
+
+def proposal_terms(summary, market):
+    if not isinstance(summary, dict) or summary.get("venue") != "spot":
+        _refuse(
+            "foom sent no spot summary for this proposal to check the transaction against"
+        )
+    side, market_id = summary.get("side"), summary.get("market_id")
+    if side not in ("buy", "sell") or not isinstance(market_id, str):
+        _refuse("the proposal's summary names no side or market")
+    if not isinstance(market, dict) or market.get("market_id") != market_id:
+        _refuse("the market foom described is not the proposal's market")
+    mint, decimals = market.get("mint"), market.get("decimals")
+    if mint == WSOL_MINT and decimals != 9:
+        _refuse("get_market sent decimals other than 9 for wrapped SOL")
+    if not is_address(mint) or mint == USDC_MINT:
+        _refuse("get_market sent no usable mint for the proposal's market")
+    if (
+        isinstance(decimals, bool)
+        or not isinstance(decimals, int)
+        or not 0 <= decimals <= 18
+    ):
+        _refuse("get_market sent no usable decimals for the proposal's market")
+    bps = summary.get("max_slippage_bps")
+    if (
+        isinstance(bps, bool)
+        or not isinstance(bps, int)
+        or not 1 <= bps <= MAX_SLIPPAGE_BPS
+    ):
+        _refuse(
+            "the proposal's max_slippage_bps is not between 1 and %d" % MAX_SLIPPAGE_BPS
+        )
+    if side == "buy":
+        amount = _atomic(summary.get("quote_amount"), USDC_DECIMALS, "quote_amount")
+    else:
+        size = summary.get("size")
+        amount = _atomic(
+            size if size is not None else summary.get("base_amount"), decimals, "size"
+        )
+    quote = market.get("quote_usd")
+    live = quote is not None and market.get("stale") is not True
+    if live and (
+        isinstance(quote, bool)
+        or not isinstance(quote, (int, float))
+        or not 0 < quote < float("inf")
+    ):
+        _refuse("get_market sent a quote_usd that is not a price")
+    return {
+        "side": side,
+        "mint": mint,
+        "decimals": decimals,
+        "amount_in": amount,
+        "max_slippage_bps": bps,
+        "quote_usd": Fraction(quote) if live else None,
+    }
+
+
+def _route(data, accounts, written, expected):
+    head = data[:8]
+    if head == ROUTE_V2:
+        at, places = 8, (0, 1, 2)
+    elif head == SHARED_ROUTE_V2:
+        at, places = 9, (1, 2, 5)
+    else:
+        _refuse("the Jupiter instruction is not a route")
+    if len(data) < at + 26:
+        _refuse("the Jupiter route is shorter than its terms")
+    steps = int.from_bytes(data[at + 22 : at + 26], "little")
+    if not 1 <= steps <= 64 or len(data) < at + 26 + steps * 5:
+        _refuse("the Jupiter route has no usable steps")
+    owner, source, destination = (
+        written(accounts, n, what)
+        for n, what in zip(places, ("owner", "source", "destination"))
+    )
+    if owner != expected["owner"]:
+        _refuse("the swap's owner is not your trading key")
+    if source != expected["source"] or destination != expected["destination"]:
+        _refuse(
+            "the swap does not run between your own token accounts for the proposal's market"
+        )
+    if head == ROUTE_V2 and written(accounts, 7, "account 7") not in (
+        JUPITER_PROGRAM,
+        destination,
+    ):
+        _refuse("the route pays out to an account other than your own")
+    amount = int.from_bytes(data[at : at + 8], "little")
+    floor = int.from_bytes(data[at + 8 : at + 16], "little")
+    slippage = int.from_bytes(data[at + 16 : at + 18], "little")
+    platform = int.from_bytes(data[at + 18 : at + 20], "little")
+    positive = int.from_bytes(data[at + 20 : at + 22], "little")
+    if amount != expected["amount_in"]:
+        _refuse("the swap spends an amount other than the proposal's")
+    if slippage or positive:
+        _refuse("the swap allows slippage beyond the floor written into it")
+    if floor < 1:
+        _refuse("the swap has no minimum out")
+    if platform > MAX_PLATFORM_FEE_BPS:
+        _refuse("the route's platform fee is above %d bps" % MAX_PLATFORM_FEE_BPS)
+    return floor
+
+
+def check_swap(raw, mine, summary, market):
+    try:
+        header, keys, instructions = parse_message(raw)
+    except (IndexError, ValueError) as error:
+        _refuse("the prepared message carries %s" % error)
+    if header[0] != 1 or header[1] != 0:
+        _refuse(
+            "the message does not want exactly one signature, yours, from a writable account"
         )
     if keys[0] != mine:
-        raise SystemExit(
-            "ERROR: refusing to sign - account 0 (the signer and fee payer) is %s, not your "
-            "trading key %s. Nothing was signed. Tell your human." % (keys[0], mine)
+        _refuse(
+            "account 0 (the signer and fee payer) is not your trading key %s" % mine
         )
-    if not instructions:
-        raise SystemExit(
-            "ERROR: refusing to sign - the message holds no instruction. Nothing was signed."
+    terms = proposal_terms(summary, market)
+    buy = terms["side"] == "buy"
+    usdc = associated_token_account(mine, USDC_MINT)
+    held = associated_token_account(mine, terms["mint"])
+    wrapped = associated_token_account(mine, WSOL_MINT)
+    native_sell = not buy and terms["mint"] == WSOL_MINT
+    expected = {
+        "owner": mine,
+        "source": usdc if buy else held,
+        "destination": held if buy else usdc,
+        "amount_in": terms["amount_in"],
+    }
+
+    def written(accounts, n, what):
+        if n >= len(accounts):
+            _refuse("an instruction is missing its %s" % what)
+        if accounts[n] >= len(keys):
+            _refuse(
+                "the %s is read from a lookup table instead of written in the message"
+                % what
+            )
+        return keys[accounts[n]]
+
+    floor, fees, creates, budget = None, [], 0, {}
+    wrapped_in, synced, closes = None, False, 0
+    for program_index, accounts, data in instructions:
+        program = keys[program_index]
+        if program == COMPUTE_BUDGET_PROGRAM:
+            op = data[:1]
+            if op == b"\x02" and len(data) == 5 and 2 not in budget:
+                budget[2] = int.from_bytes(data[1:5], "little")
+            elif op == b"\x03" and len(data) == 9 and 3 not in budget:
+                budget[3] = int.from_bytes(data[1:9], "little")
+            else:
+                _refuse("the compute budget is not one unit limit and one unit price")
+        elif program == ATA_PROGRAM:
+            if floor is not None or data != b"\x01" or len(accounts) != 6:
+                _refuse(
+                    "a token-account instruction other than opening one before the swap"
+                )
+            if (
+                written(accounts, 0, "payer of a new token account") != mine
+                or written(accounts, 2, "owner of a new token account") != mine
+            ):
+                _refuse("a new token account is not paid for and owned by your wallet")
+            if written(accounts, 5, "token program") not in (
+                TOKEN_PROGRAM,
+                TOKEN_2022_PROGRAM,
+            ):
+                _refuse("a new token account names an unknown token program")
+            written(accounts, 1, "new token account")
+            creates += 1
+            if creates > MAX_TOKEN_ACCOUNTS:
+                _refuse(
+                    "the transaction opens more than %d token accounts"
+                    % MAX_TOKEN_ACCOUNTS
+                )
+        elif program == SYSTEM_PROGRAM:
+            if not native_sell or floor is not None or wrapped_in is not None:
+                _refuse("a SOL transfer outside wrapping the SOL you sell")
+            if (
+                len(data) != 12
+                or data[:4] != (2).to_bytes(4, "little")
+                or len(accounts) != 2
+            ):
+                _refuse("a system instruction other than one SOL transfer")
+            if (
+                written(accounts, 0, "SOL sender") != mine
+                or written(accounts, 1, "SOL recipient") != wrapped
+            ):
+                _refuse(
+                    "SOL moves to an account other than your own wrapped SOL account"
+                )
+            wrapped_in = int.from_bytes(data[4:12], "little")
+        elif program == TOKEN_PROGRAM:
+            op = data[:1]
+            if op == b"\x11":
+                if (
+                    wrapped_in is None
+                    or synced
+                    or floor is not None
+                    or len(data) != 1
+                    or len(accounts) != 1
+                    or written(accounts, 0, "wrapped SOL account") != wrapped
+                ):
+                    _refuse(
+                        "a token sync other than the one after wrapping the SOL you sell"
+                    )
+                synced = True
+            elif op == b"\x09":
+                if floor is None or closes or len(data) != 1 or len(accounts) != 3:
+                    _refuse("a token account is closed other than once, after the swap")
+                if (
+                    written(accounts, 0, "closed account") != wrapped
+                    or written(accounts, 1, "rent recipient") != mine
+                    or written(accounts, 2, "close authority") != mine
+                ):
+                    _refuse(
+                        "an account other than your wrapped SOL account is closed, or its rent goes elsewhere"
+                    )
+                closes += 1
+            elif op == b"\x0c":
+                if len(data) != 10 or data[9] != USDC_DECIMALS or len(accounts) != 4:
+                    _refuse("a token transfer that is not a 6-decimal USDC fee")
+                if (
+                    written(accounts, 0, "fee source") != usdc
+                    or written(accounts, 3, "fee authority") != mine
+                ):
+                    _refuse(
+                        "a token transfer that is not foom's fee from your own USDC account"
+                    )
+                written(accounts, 2, "fee recipient")
+                fees.append(int.from_bytes(data[1:9], "little"))
+            else:
+                _refuse("a token instruction a swap does not use")
+        elif program == JUPITER_PROGRAM:
+            if floor is not None:
+                _refuse("the transaction holds more than one swap")
+            floor = _route(data, accounts, written, expected)
+        else:
+            _refuse("an instruction for a program a foom swap does not use")
+    if floor is None:
+        _refuse("the transaction holds no swap")
+    if native_sell and (wrapped_in != terms["amount_in"] or not synced):
+        _refuse(
+            "the SOL you sell is not wrapped into your own account for exactly the proposal's amount"
         )
-    for program, data in instructions:
-        if (
-            program == SYSTEM_PROGRAM
-            and len(data) >= 4
-            and int.from_bytes(data[:4], "little")
-            in (SYSTEM_ASSIGN, SYSTEM_ASSIGN_WITH_SEED)
-        ):
-            raise SystemExit(
-                "ERROR: refusing to sign - the message would change the owner of an account, "
-                "which no trade needs. Nothing was signed. Tell your human."
-            )
-        if program in TOKEN_PROGRAMS and data[:1] in (
-            bytes([TOKEN_APPROVE]),
-            bytes([TOKEN_APPROVE_CHECKED]),
-            bytes([TOKEN_SET_AUTHORITY]),
-        ):
-            raise SystemExit(
-                "ERROR: refusing to sign - the message carries a token approval or authority change, "
-                "which no trade needs. Nothing was signed. Tell your human."
-            )
+    if len(fees) != 1:
+        _refuse("the transaction does not hold exactly one foom fee")
+    fee, bps = fees[0], terms["max_slippage_bps"]
+    if buy:
+        over = fee * 10000 > (terms["amount_in"] + fee) * MAX_FEE_BPS
+    else:
+        over = fee * (10000 - bps) > floor * MAX_FEE_BPS
+    if fee > MAX_FEE_FLOOR_ATOMIC and over:
+        _refuse("foom's fee is above the larger of $0.95 and 2% of the trade")
+    units = budget.get(2, MAX_COMPUTE_UNITS)
+    priority = -(-budget.get(3, 0) * units // 10**6)
+    ceiling = os.environ.get("FOOM_TRADE_MAX_PRIORITY_LAMPORTS", MAX_PRIORITY_LAMPORTS)
+    if not ceiling.isascii() or not ceiling.isdigit():
+        _refuse("FOOM_TRADE_MAX_PRIORITY_LAMPORTS is not a whole number of lamports")
+    if priority > int(ceiling):
+        _refuse("the priority fee is above %s lamports" % ceiling)
+    quote = terms["quote_usd"]
+    if quote is not None:
+        tokens = Fraction(floor if buy else terms["amount_in"], 10 ** terms["decimals"])
+        usdc_amount = Fraction(
+            terms["amount_in"] if buy else floor, 10**USDC_DECIMALS
+        )
+        implied = usdc_amount / tokens
+        if abs(implied - quote) * 10000 > quote * (bps + PRICE_MARGIN_BPS):
+            _refuse("the swap's floor implies a price too far from the market price")
+    return {
+        "side": terms["side"],
+        "mint": terms["mint"],
+        "decimals": terms["decimals"],
+        "amount_in": terms["amount_in"],
+        "floor": floor,
+        "fee": fee,
+        "priority_lamports": priority,
+    }
+
+
+def _amount(atomic, decimals):
+    whole, part = divmod(atomic, 10**decimals)
+    text = (
+        ("%d.%0*d" % (whole, decimals, part)).rstrip("0").rstrip(".")
+        if decimals
+        else str(whole)
+    )
+    return text
+
+
+def _usdc(value):
+    return "%s USDC" % _amount(value, USDC_DECIMALS)
+
+
+def describe(seen):
+    decimals = seen["decimals"]
+    if seen["side"] == "buy":
+        trade = "buy %s with %s, at least %s out" % (
+            seen["mint"],
+            _usdc(seen["amount_in"]),
+            _amount(seen["floor"], decimals),
+        )
+    else:
+        trade = "sell %s of %s for at least %s before foom's fee" % (
+            _amount(seen["amount_in"], decimals),
+            seen["mint"],
+            _usdc(seen["floor"]),
+        )
+    return "Signing: %s; foom fee %s; priority fee at most %d lamports." % (
+        trade,
+        _usdc(seen["fee"]),
+        seen["priority_lamports"],
+    )
 
 
 def wire_transaction(seed, message):
@@ -539,8 +918,29 @@ def clear_state(proposal_id):
 # --- execute ----------------------------------------------------------------------
 
 
-def prepare_and_sign(proposal_id, seed, mine):
+def market_of(ctx):
+    if ctx.get("market") is None:
+        summary = ctx.get("summary")
+        if not isinstance(summary, dict) or summary.get("venue") != "spot":
+            _refuse(
+                "foom sent no spot summary for this proposal to check the transaction against"
+            )
+        market, refusal = mcp_call(TOOL_MARKET, {"market_id": summary.get("market_id")})
+        if refusal is not None:
+            code = refusal.get("error")
+            shown = code if isinstance(code, str) and _is_code(code) else "no code"
+            raise SystemExit(
+                "ERROR: refusing to sign - foom refused to show the proposal's market (%s). "
+                "Nothing was signed. Run this again later." % shown
+            )
+        proposal_terms(summary, market)
+        ctx["market"] = market
+    return ctx["market"]
+
+
+def prepare_and_sign(proposal_id, seed, mine, ctx):
     """Ask FOOM for the bytes, check them, sign, and record the state before anything is sent."""
+    market = market_of(ctx)
     prepared, refusal = mcp_call(TOOL_PREPARE, {"id": proposal_id})
     if refusal is not None:
         return None, refusal
@@ -553,7 +953,9 @@ def prepare_and_sign(proposal_id, seed, mine):
         raise SystemExit(
             "ERROR: prepare answered with a message that is not base64. Tell your human."
         )
-    check_message(message, mine)
+    seen = check_swap(message, mine, ctx["summary"], market)
+    print(describe(seen))
+    sys.stdout.flush()
     state = {
         "proposal_id": proposal_id,
         "approval_jwt": prepared["approval_jwt"],
@@ -566,7 +968,7 @@ def prepare_and_sign(proposal_id, seed, mine):
     return state, None
 
 
-def execute(proposal_id):
+def execute(proposal_id, send=True):
     seed = need_seed()
     mine = b58(pubkey(seed))
     if not KEY:
@@ -581,8 +983,7 @@ def execute(proposal_id):
             % (proposal_id, refusal.get("error"))
         )
     # A perp proposal is signed with the Ethereum key, by the other recipe.
-    # An older foom sends no summary: that proposal is spot. Checked before the
-    # status, because a perp proposal has statuses of its own.
+    # Checked before the status, because a perp proposal has statuses of its own.
     summary = proposal.get("summary")
     if isinstance(summary, dict) and summary.get("venue") == "perp":
         raise SystemExit(
@@ -603,6 +1004,7 @@ def execute(proposal_id):
             % (proposal_id, status)
         )
 
+    ctx = {"summary": summary}
     state = load_state(proposal_id)
     if status == "approved" and state is None:
         raise SystemExit(
@@ -613,18 +1015,39 @@ def execute(proposal_id):
     retried = False
     resends = 0
     earlier_code = None
-    if status == "pending" or state is None:
-        state, refusal = _prepare_through_a_busy_quote(proposal_id, seed, mine)
-        state, refusal = _retry_prepare(proposal_id, seed, mine, state, refusal)
+    if state is None:
+        state, refusal = _prepare_through_a_busy_quote(proposal_id, seed, mine, ctx)
+        state, refusal = _retry_prepare(proposal_id, seed, mine, ctx, state, refusal)
         if refusal is not None:
             return _stop_on(refusal, proposal_id)
         retried = state.get("_retried", False)
         earlier_code = state.get("_earlier")
+    elif not send:
+        raise SystemExit(
+            "ERROR: proposal %s was already signed on this machine. Nothing new was signed. "
+            "Run `python3 scripts/foom_spot.py execute %s`: it sends the signed transaction, "
+            "and prepares a replacement only after foom says those bytes cannot land."
+            % (proposal_id, proposal_id)
+        )
     else:
         print(
             "Resuming proposal %s with the transaction signed earlier; nothing is signed twice."
             % proposal_id
         )
+
+    if not send:
+        print(
+            json.dumps(
+                {
+                    "id": proposal_id,
+                    "proposal": {
+                        "approval_jwt": state["approval_jwt"],
+                        "signed_transaction": state["signed_transaction"],
+                    },
+                }
+            )
+        )
+        return 0
 
     while True:
         executed, refusal = mcp_call(
@@ -674,9 +1097,9 @@ def execute(proposal_id):
             print("FOOM answered %s; preparing once more." % code)
             # The earlier state file stays until the new prepare succeeds, so a
             # refused re-prepare leaves bytes a rerun can resend.
-            state, refusal = prepare_and_sign(proposal_id, seed, mine)
+            state, refusal = prepare_and_sign(proposal_id, seed, mine, ctx)
             state, refusal = _retry_prepare(
-                proposal_id, seed, mine, state, refusal, allow=False
+                proposal_id, seed, mine, ctx, state, refusal, allow=False
             )
             if refusal is not None:
                 return _stop_on(dict(refusal, _earlier=earlier_code), proposal_id)
@@ -733,7 +1156,7 @@ def _positive(value, default):
     return float(value)
 
 
-def _prepare_through_a_busy_quote(proposal_id, seed, mine):
+def _prepare_through_a_busy_quote(proposal_id, seed, mine, ctx):
     """Prepare, and prepare again while FOOM cannot get a fresh quote.
 
     Runs only before anything was signed for this proposal. FOOM ends it by
@@ -742,7 +1165,7 @@ def _prepare_through_a_busy_quote(proposal_id, seed, mine):
     tries = 0
     while True:
         tries += 1
-        state, refusal = prepare_and_sign(proposal_id, seed, mine)
+        state, refusal = prepare_and_sign(proposal_id, seed, mine, ctx)
         if refusal is None or refusal.get("error") != "quote_unavailable":
             return state, refusal
         wait = _positive(refusal.get("retry_after_seconds"), QUOTE_WAIT_SECONDS)
@@ -757,7 +1180,7 @@ def _prepare_through_a_busy_quote(proposal_id, seed, mine):
         time.sleep(wait)
 
 
-def _retry_prepare(proposal_id, seed, mine, state, refusal, allow=True):
+def _retry_prepare(proposal_id, seed, mine, ctx, state, refusal, allow=True):
     """One more prepare when the first one was refused for a retryable reason."""
     if refusal is None or not allow:
         return state, refusal
@@ -772,7 +1195,7 @@ def _retry_prepare(proposal_id, seed, mine, state, refusal, allow=True):
         )
         time.sleep(float(wait))
     print("FOOM answered %s; preparing once more." % code)
-    state, refusal = prepare_and_sign(proposal_id, seed, mine)
+    state, refusal = prepare_and_sign(proposal_id, seed, mine, ctx)
     if state is not None:
         state["_retried"] = True
         state["_earlier"] = code
@@ -886,21 +1309,12 @@ def main(argv):
         print(b58(sign(seed, message.encode())))
         return 0
     if command == "sign":
-        if rest[:1] == ["--message"] and len(rest) == 2:
-            message_b64 = rest[1]
-        elif not rest:
-            message_b64 = sys.stdin.read().strip()
-        else:
+        if len(rest) != 1 or not rest[0] or rest[0].startswith("-"):
             raise SystemExit(
-                "usage: foom_spot.py sign [--message <base64>]  (or the message on stdin)"
+                "usage: foom_spot.py sign <proposal id>  (prepares your proposal, checks the "
+                "transaction, signs it and prints the arguments for execute_trade_proposal)"
             )
-        try:
-            message = base64.b64decode(message_b64, validate=True)
-        except (ValueError, TypeError):
-            raise SystemExit("ERROR: the message is not base64.")
-        check_message(message, mine)
-        print(wire_transaction(seed, message))
-        return 0
+        return execute(rest[0], send=False)
     if command == "execute":
         if len(rest) != 1 or not rest[0]:
             raise SystemExit("usage: foom_spot.py execute <proposal id>")
