@@ -236,18 +236,39 @@ and you move USDC between them yourself.
    twice. `partial_leverage_only` means the leverage change landed and the order did not run;
    propose again if you still want it. Before preparing, the recipe reads your positions,
    retrying once on a failure other than foom's read limit; if that retry fails too, it
-   prepares anyway, since the plan may not need the positions check at all - if it does, the
-   read taken right after the prepare decides instead, and that one never waits. Only when foom
+   prepares anyway, since the plan may not need the positions check at all. If it does, the
+   recipe reads positions once more right after the prepare, and that read never waits: it
+   falls in the same minute as the prepare, so foom's read limit usually refuses it, and
+   a plan with a leverage change stops there unsigned; run it again in a minute. Only when foom
    marks the proposal reduce-only (`summary.reduce_only`) does the recipe skip the read before
    the prepare; if foom still prepares a leverage change for that order, the recipe signs
    nothing: to close or shrink the position, propose it again without a leverage value, which
    keeps the current setting. When foom
-   answers `agent_hl_read_ceiling` (its per-minute limit on Hyperliquid reads for agents), the
-   recipe waits for the next minute and asks again, up to three times for the whole run; if it
+   answers `agent_hl_read_ceiling` (its per-minute limit on Hyperliquid reads for agents)
+   before a prepare, the recipe waits for the next minute and asks again, up to three times for the whole run; if it
    still stops there, run it again a minute later.
 6. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2). It
    signs only when Relay's order pays your own wallet, so it needs your Solana trading key on
    this machine as well (`~/.deva/trading.key`, or `--solana-key-file <path>` before the command).
+   How much: call `get_positions` right before the move and ask for at most its
+   `perps_withdrawable_usd`, not `perps_cash_usd`. `perps_cash_usd` is the account value and
+   includes the margin your open positions hold, which cannot be moved out
+   until the position is reduced or closed; do that only if you or your human want that trade.
+   With a position open, what can be moved out moves with the price, so read it again before
+   every move instead of reusing an earlier number. Positions use cross margin, so moving money
+   out while one is open leaves less behind it and brings liquidation closer: keep a buffer, and
+   check the liquidation price in `get_positions` afterwards. A refusal of
+   `route_unavailable` with reason `perps_balance_insufficient` means the amount is more than can
+   be moved out now: read `get_positions` again and ask for less. Reason
+   `perps_balance_insufficient_first_transfer_fee` means Hyperliquid takes its
+   one-time activation fee (1 USDC today) on this wallet's first move out, on top of the amount;
+   only a wallet first funded some other way than `transfer to-perps` pays it there. Ask for
+   at least that fee less than `perps_withdrawable_usd`. When it is below $2 (or below
+   $2 plus that fee when the fee applies), nothing can be moved yet. Both reasons can also come
+   after the transfer was signed, when foom runs it: nothing moved, and the recipe keeps the
+   signed transfer and finishes it before it starts another. Then
+   run the same command again (it resends the same amount, which goes through if the balance
+   came back); once it says the quote expired, read `get_positions` again and ask for less.
 
 One transfer at a time: while one is unfinished, the recipe finishes it before it starts another.
 `manual_review` means part of a move ran and foom reviews it by hand. Do not repeat it; when foom
