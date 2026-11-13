@@ -1782,6 +1782,8 @@ MAX_PREPARES = 5
 RESEND_WAIT_SECONDS = float(os.environ.get("FOOM_TRADE_RESEND_WAIT_SECONDS", "10"))
 MAX_RESEND_WAIT_SECONDS = 15
 MAX_RESENDS = 2
+MAX_READ_LIMIT_WAIT_SECONDS = 60
+MAX_READ_LIMIT_WAITS = 3
 
 # The dashboard substitutes the placeholder below; when you copied this from
 # the skill it is still a placeholder, so the key is read from your environment.
@@ -1912,6 +1914,37 @@ def refusal_text(refusal, doing):
     return text
 
 
+def _read_limit_wait(name, refusal, waits):
+    """The seconds to wait before asking again after foom's Hyperliquid read limit
+    refused name, printed on screen; None when the refusal is another one or the
+    waits are used up."""
+    if refusal is None or refusal.get("error") != "agent_hl_read_ceiling":
+        return None
+    wait = _positive(refusal.get("retry_after_seconds"), MAX_READ_LIMIT_WAIT_SECONDS)
+    if wait > MAX_READ_LIMIT_WAIT_SECONDS or waits >= MAX_READ_LIMIT_WAITS:
+        return None
+    print(
+        "foom's limit on Hyperliquid reads for agents is reached for this minute; "
+        "waiting %g s, then asking %s again (wait %d of %d)."
+        % (wait, name, waits + 1, MAX_READ_LIMIT_WAITS)
+    )
+    sys.stdout.flush()
+    return wait
+
+
+def through_read_limit(name, arguments):
+    """Call a tool foom counts against its Hyperliquid read limit, waiting for the
+    next minute when the limit is reached. Returns (result, refusal) like mcp_call."""
+    waits = 0
+    while True:
+        result, refusal = mcp_call(name, arguments)
+        wait = _read_limit_wait(name, refusal, waits)
+        if wait is None:
+            return result, refusal
+        waits += 1
+        time.sleep(wait)
+
+
 # --- the state files ---------------------------------------------------------------
 # One file per thing in flight, written before anything is sent, so a re-run
 # resends what it already signed instead of signing again.
@@ -2038,9 +2071,54 @@ def _ended(proposal_id, status, already):
     return 0
 
 
-def prepare_and_sign(proposal_id, seed, mine, summary):
+class PositionsRead:
+    """get_positions for one prepare: read right before it, and again after any wait."""
+
+    def __init__(self):
+        self.kept = None
+
+    def early(self):
+        """The read before a prepare, which may wait for foom's read limit: nothing is
+        prepared yet. Only that limit stops the run here, since the prepare would be
+        refused by it too; any other refusal is read again if the plan changes leverage.
+        """
+        if self.kept is None:
+            positions, refusal = through_read_limit(TOOL_POSITIONS, {})
+            if refusal is None:
+                self.kept = positions
+            elif refusal.get("error") == "agent_hl_read_ceiling":
+                return dict(refusal, _positions="early")
+        return None
+
+    def needed(self):
+        """The read a leverage change is checked against. After a prepare it never waits:
+        the prepared plan is only valid for a short time."""
+        if self.kept is None:
+            positions, refusal = mcp_call(TOOL_POSITIONS, {})
+            if refusal is not None:
+                return None, dict(refusal, _positions="leverage")
+            self.kept = positions
+        return self.kept, None
+
+    def forget(self):
+        self.kept = None
+
+
+def prepare_and_sign(proposal_id, seed, mine, summary, read_positions):
     """Ask foom for the plan, check it, sign it, and record the state before anything is sent."""
-    prepared, refusal = mcp_call(TOOL_PREPARE, {"id": proposal_id})
+    waits = 0
+    while True:
+        if _is_int(summary.get("leverage")):
+            refusal = read_positions.early()
+            if refusal is not None:
+                return None, refusal
+        prepared, refusal = mcp_call(TOOL_PREPARE, {"id": proposal_id})
+        wait = _read_limit_wait(TOOL_PREPARE, refusal, waits)
+        if wait is None:
+            break
+        waits += 1
+        time.sleep(wait)
+        read_positions.forget()
     if refusal is not None:
         return None, refusal
     for field in PREPARE_FIELDS:
@@ -2055,14 +2133,9 @@ def prepare_and_sign(proposal_id, seed, mine, summary):
         )
     positions = None
     if "leverageAction" in plan or "leverageNonce" in plan:
-        positions, refusal = mcp_call(TOOL_POSITIONS, {})
+        positions, refusal = read_positions.needed()
         if refusal is not None:
-            raise SystemExit(
-                "ERROR: "
-                + refusal_text(refusal, "show your positions")
-                + " The leverage change could not be checked against the position you hold. "
-                "Nothing was signed. Run this again."
-            )
+            return None, refusal
     parts = perp_parts(plan, summary, market, mine, int(time.time() * 1000), positions)
     signed = {}
     for name, action, nonce in parts:
@@ -2090,13 +2163,19 @@ def prepare_and_sign(proposal_id, seed, mine, summary):
     return state, None
 
 
-def _prepare_through_a_busy_quote(proposal_id, seed, mine, summary):
+def _prepare_through_a_busy_quote(proposal_id, seed, mine, summary, read_positions):
     """Prepare, and prepare again while foom cannot get a fresh quote. Nothing is signed yet."""
     tries = 0
     while True:
         tries += 1
-        state, refusal = prepare_and_sign(proposal_id, seed, mine, summary)
-        if refusal is None or refusal.get("error") != "quote_unavailable":
+        state, refusal = prepare_and_sign(
+            proposal_id, seed, mine, summary, read_positions
+        )
+        if (
+            refusal is None
+            or refusal.get("error") != "quote_unavailable"
+            or refusal.get("_positions")
+        ):
             return state, refusal
         wait = _positive(refusal.get("retry_after_seconds"), QUOTE_WAIT_SECONDS)
         if wait > MAX_QUOTE_WAIT_SECONDS or tries >= MAX_PREPARES:
@@ -2106,9 +2185,10 @@ def _prepare_through_a_busy_quote(proposal_id, seed, mine, summary):
             % (tries, MAX_PREPARES, wait)
         )
         time.sleep(wait)
+        read_positions.forget()
 
 
-def _prepare_once_more(proposal_id, seed, mine, summary, refusal):
+def _prepare_once_more(proposal_id, seed, mine, summary, read_positions, refusal):
     """One more prepare after foom said the earlier plan cannot run any more."""
     code = refusal.get("error")
     wait = _positive(refusal.get("retry_after_seconds"), None)
@@ -2119,7 +2199,8 @@ def _prepare_once_more(proposal_id, seed, mine, summary, refusal):
         )
         time.sleep(wait)
     print("foom answered %s; preparing once more." % code)
-    state, again = prepare_and_sign(proposal_id, seed, mine, summary)
+    read_positions.forget()
+    state, again = prepare_and_sign(proposal_id, seed, mine, summary, read_positions)
     if again is not None:
         again = dict(again, _earlier=code)
     return state, again
@@ -2158,7 +2239,16 @@ def _stop_on(refusal, proposal_id, signed=False, sent=False):
     code = refusal.get("error")
     if code == "proposal_unavailable":
         return _proposal_unavailable(proposal_id)
-    text = "ERROR: " + refusal_text(refusal, "run proposal %s" % proposal_id)
+    if refusal.get("_positions") == "leverage":
+        text = (
+            "ERROR: "
+            + refusal_text(refusal, "show your positions")
+            + " The leverage change could not be checked against the position you hold."
+        )
+    elif refusal.get("_positions"):
+        text = "ERROR: " + refusal_text(refusal, "show your positions")
+    else:
+        text = "ERROR: " + refusal_text(refusal, "run proposal %s" % proposal_id)
     if refusal.get("_earlier"):
         text += " (after %s)" % refusal["_earlier"]
     if sent:
@@ -2176,6 +2266,10 @@ def _stop_on(refusal, proposal_id, signed=False, sent=False):
         text += (
             " Nothing was signed. Wait a minute, then run this again, or propose again."
         )
+    elif refusal.get("_positions") == "early":
+        text += " Nothing was signed. Run this again in a minute."
+    elif refusal.get("_positions"):
+        text += " Nothing was signed. Run this again."
     else:
         text += " Nothing was sent."
     raise SystemExit(text)
@@ -2226,6 +2320,7 @@ def execute(proposal_id):
             "and propose again." % (proposal_id, state["address"], evm_key_path(), mine)
         )
     retried = False
+    read_positions = PositionsRead()
     if state is None:
         if status == "approved":
             raise SystemExit(
@@ -2234,14 +2329,17 @@ def execute(proposal_id):
                 "Run this again later to read the outcome; do not propose again until it ends."
                 % proposal_id
             )
-        state, refusal = _prepare_through_a_busy_quote(proposal_id, seed, mine, summary)
-        if refusal is not None and refusal.get("error") in (
-            "preparation_pending",
-            "preparation_expired",
-            "invalid_approval",
+        state, refusal = _prepare_through_a_busy_quote(
+            proposal_id, seed, mine, summary, read_positions
+        )
+        if (
+            refusal is not None
+            and not refusal.get("_positions")
+            and refusal.get("error")
+            in ("preparation_pending", "preparation_expired", "invalid_approval")
         ):
             state, refusal = _prepare_once_more(
-                proposal_id, seed, mine, summary, refusal
+                proposal_id, seed, mine, summary, read_positions, refusal
             )
             retried = True
         if refusal is not None:
@@ -2286,7 +2384,9 @@ def execute(proposal_id):
         ):
             retried = True
             # The earlier state file stays until the new prepare succeeds.
-            state, again = _prepare_once_more(proposal_id, seed, mine, summary, refusal)
+            state, again = _prepare_once_more(
+                proposal_id, seed, mine, summary, read_positions, refusal
+            )
             if again is not None:
                 return _stop_on(again, proposal_id, sent=True)
             continue
