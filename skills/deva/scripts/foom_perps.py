@@ -1787,11 +1787,51 @@ MAX_READ_LIMIT_WAITS = (
     3  # shared for the whole run: every early read and every prepare wait
 )
 
+DEVA_KEY_PATH = os.path.expanduser("~/.deva/api_key")
+
+
+def _key_from_file(path):
+    fix = "Run: chmod 700 ~/.deva && chmod 600 ~/.deva/api_key"
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        sys.stderr.write(
+            "WARNING: cannot read ~/.deva/api_key (%s). It must be a file of your "
+            "own, not a link, holding only the key.\n" % type(e).__name__
+        )
+        return ""
+    try:
+        with os.fdopen(fd, encoding="utf-8-sig") as f:
+            info = os.fstat(f.fileno())
+            words = f.read().split()
+        folder = os.stat(os.path.dirname(path))
+    except (OSError, UnicodeDecodeError) as e:
+        sys.stderr.write(
+            "WARNING: cannot read ~/.deva/api_key (%s). Save the key there again, "
+            "alone on one line.\n" % type(e).__name__
+        )
+        return ""
+    if os.name == "posix" and (
+        info.st_uid != os.getuid()
+        or folder.st_uid != os.getuid()
+        or (info.st_mode | folder.st_mode) & 0o077
+    ):
+        sys.stderr.write(
+            "WARNING: ~/.deva/api_key is not used: ~/.deva and the file must be "
+            "yours and private to you. %s\n" % fix
+        )
+        return ""
+    return words[0] if words else ""
+
+
 # The dashboard substitutes the placeholder below; when you copied this from
-# the skill it is still a placeholder, so the key is read from your environment.
+# the skill it is still a placeholder, so the key is read from DEVA_API_KEY,
+# else from ~/.deva/api_key.
 KEY = "$DEVA_API_KEY"
 if KEY.startswith("$") or KEY.startswith("YOUR_"):
-    KEY = os.environ.get("DEVA_API_KEY", "")
+    KEY = os.environ.get("DEVA_API_KEY", "").strip() or _key_from_file(DEVA_KEY_PATH)
 
 _rpc_id = 0
 
@@ -1891,7 +1931,10 @@ def need(payload, key, what):
 
 def need_deva_key():
     if not KEY:
-        raise SystemExit("ERROR: no Deva API key. Set DEVA_API_KEY and run again.")
+        raise SystemExit(
+            "ERROR: no Deva API key. Save it to ~/.deva/api_key (chmod 600) or set "
+            "DEVA_API_KEY, then run again."
+        )
 
 
 def _positive(value, default):

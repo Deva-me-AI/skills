@@ -62,11 +62,51 @@ CLAIM_LAYOUT = {
 # Token-account creation (Create, legacy empty Create, CreateIdempotent) only.
 ASSOCIATED_TOKEN_CREATE = (b"", b"\x00", b"\x01")
 
+DEVA_KEY_PATH = os.path.expanduser("~/.deva/api_key")
+
+
+def _key_from_file(path):
+    fix = "Run: chmod 700 ~/.deva && chmod 600 ~/.deva/api_key"
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        sys.stderr.write(
+            "WARNING: cannot read ~/.deva/api_key (%s). It must be a file of your "
+            "own, not a link, holding only the key.\n" % type(e).__name__
+        )
+        return ""
+    try:
+        with os.fdopen(fd, encoding="utf-8-sig") as f:
+            info = os.fstat(f.fileno())
+            words = f.read().split()
+        folder = os.stat(os.path.dirname(path))
+    except (OSError, UnicodeDecodeError) as e:
+        sys.stderr.write(
+            "WARNING: cannot read ~/.deva/api_key (%s). Save the key there again, "
+            "alone on one line.\n" % type(e).__name__
+        )
+        return ""
+    if os.name == "posix" and (
+        info.st_uid != os.getuid()
+        or folder.st_uid != os.getuid()
+        or (info.st_mode | folder.st_mode) & 0o077
+    ):
+        sys.stderr.write(
+            "WARNING: ~/.deva/api_key is not used: ~/.deva and the file must be "
+            "yours and private to you. %s\n" % fix
+        )
+        return ""
+    return words[0] if words else ""
+
+
 # The dashboard substitutes the placeholder below; when you copied this from
-# skill.md it is still a placeholder, so the key is read from your environment.
+# skill.md it is still a placeholder, so the key is read from DEVA_API_KEY,
+# else from ~/.deva/api_key.
 KEY = "$DEVA_API_KEY"
 if KEY.startswith("$") or KEY.startswith("YOUR_"):
-    KEY = os.environ.get("DEVA_API_KEY", "")
+    KEY = os.environ.get("DEVA_API_KEY", "").strip() or _key_from_file(DEVA_KEY_PATH)
 
 # --- ed25519 (RFC 8032), stdlib fallback; `cryptography` used when present ---
 _p = 2**255 - 19
@@ -556,8 +596,9 @@ def main():
         return 1
     if not KEY:
         print(
-            "ERROR: no Deva API key. Set DEVA_API_KEY, or copy this script from "
-            "your dashboard where the key is filled in for you."
+            "ERROR: no Deva API key. Save it to ~/.deva/api_key (chmod 600) or "
+            "set DEVA_API_KEY, or copy this script from your dashboard where the "
+            "key is filled in for you."
         )
         return 1
     seed = load_seed()
