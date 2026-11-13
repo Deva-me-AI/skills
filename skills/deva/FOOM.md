@@ -191,14 +191,16 @@ Then:
    python3 scripts/foom_spot.py execute <proposal id>
    ```
 
-   It asks foom to prepare the transaction, checks the bytes, signs them with your trading key,
-   sends them back through the connector and waits for `filled` or `failed`. It is safe to re-run:
-   a rerun resends the transaction it already signed, and it signs a replacement only after foom
-   reports that the earlier bytes cannot land (`preparation_expired`, `invalid_approval`, or
-   `preparation_pending` once its wait has passed). Prefer to look before you sign? Call
-   `prepare_trade_proposal` yourself, read the answer, then
-   `python3 scripts/foom_spot.py sign --message "<prepared.message>"` and send the printed
-   transaction with `execute_trade_proposal` as `{id, proposal: {approval_jwt, signed_transaction}}`.
+   It reads the market with `get_market`, asks foom to prepare the transaction, checks it against
+   your proposal, prints one line saying what it signs, signs it with your trading key, sends it
+   back through the connector and waits for `filled` or `failed`. It is safe to re-run: a rerun
+   resends the transaction it already signed, and it signs a replacement only after foom reports
+   that the earlier bytes cannot land (`preparation_expired`, `invalid_approval`, or
+   `preparation_pending` once its wait has passed). To send it yourself, run
+   `python3 scripts/foom_spot.py sign <proposal id>`: it prepares and checks the same way, signs,
+   and prints the arguments for `execute_trade_proposal` (`{id, proposal: {approval_jwt,
+   signed_transaction}}`) on its last line. The recipe signs only a transaction foom prepared for
+   your own proposal, after the checks below.
 3. Time matters: a prepared transaction is signable for at most 120 seconds and can land only until
    the chain passes `last_valid_block_height`, usually about a minute. If you are too slow the
    connector answers `preparation_expired`; prepare again. `preparation_pending` means the last
@@ -223,10 +225,24 @@ minus 0.01, which keeps about 0.01 SOL for fees and token-account rent. If that 
 or less than $2 worth, do not sell SOL. To sell SOL you bought, also sell no more than
 what the buy added (compare `amount_atomic` before and after).
 
-The recipe only ever signs a transaction whose single signer and fee payer is your trading key,
-for a proposal you made, and only with `broadcast: foom` (foom sends it). The connector's execute
-tool also accepts `broadcast: agent` for an agent that sends the transaction with its own RPC; if
-you do that, report the exact bytes right away, or foom never sees the trade.
+**What the recipe checks before it signs.** The transaction must be the swap of your proposal
+(`get_proposal`'s `summary`): your trading key is its only signer and pays its fee; it holds one
+Jupiter route between your own token accounts for the proposal's market (from `get_market`'s
+`mint`), spending exactly the proposal's amount (`quote_amount` USDC for a buy, the sell's size in
+whole tokens using `get_market`'s `decimals`), with no slippage beyond the minimum written into it;
+that minimum is within your `max_slippage_bps` plus 5% of `quote_usd` when `quote_usd` is set and
+the market is not `stale`; foom's fee is one USDC transfer from your own USDC account of at most the larger of $0.95
+and 2% of the trade; the priority fee is at most 5,000,000 lamports (set
+`FOOM_TRADE_MAX_PRIORITY_LAMPORTS` to change it); it opens at most 4 token accounts, all yours;
+wrapped SOL moves only between your wallet and your own wrapped SOL account; and the swap's owner,
+source and destination, foom's fee source and recipient, and every account of yours that sends or
+receives SOL or closes are written in the transaction, not read from a lookup table. A refusal
+says `refusing to sign` and which of these failed, and nothing was signed: prepare again, and if
+the same refusal repeats, tell your human.
+
+`execute` sends with `broadcast: foom` (foom sends it). The connector's execute tool also accepts
+`broadcast: agent` for an agent that sends the transaction with its own RPC; if you do that,
+report the exact bytes right away, or foom never sees the trade.
 
 ## 7. Perps
 
