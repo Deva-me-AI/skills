@@ -9,16 +9,17 @@ leave this machine and are never read from an argument.
     python3 scripts/foom_perps.py sign-challenge <persona id> <challenge>   # wallet-challenge signature
     python3 scripts/foom_perps.py transfer to-perps <usd>      # Token cash -> Perps cash
     python3 scripts/foom_perps.py approve-builder-fee          # once per Ethereum wallet, before the first order
+    python3 scripts/foom_perps.py switch-to-unified            # once per account, after approve-builder-fee
     python3 scripts/foom_perps.py execute <proposal id>        # prepare -> check -> sign -> execute -> wait
     python3 scripts/foom_perps.py transfer to-cash <usd>       # Perps cash -> Token cash
 
-The Ethereum key signs six things and nothing else: the wallet challenge, the
-builder-fee approval, a perp order and its leverage change, and the two
-messages that move Perps cash back. Each one is rebuilt here from its fields
-and checked before it is signed; no command signs a message or a hash you hand
-it. `transfer to-perps` is a Solana transaction, signed with the Solana key the
-spot recipe keeps (`--solana-key-file <path>` before the command reads another
-file). A transfer in either direction is signed only when Relay's order pays
+The Ethereum key signs seven things and nothing else: the wallet challenge, the
+builder-fee approval, the switch of its own wallet to a unified account, a perp
+order and its leverage change, and the two messages that move Perps cash back.
+Each one is rebuilt here from its fields and checked before it is signed; no
+command signs a message or a hash you hand it. `transfer to-perps` is a Solana
+transaction, signed with the Solana key the spot recipe keeps
+(`--solana-key-file <path>` before the command reads another file). A transfer in either direction is signed only when Relay's order pays
 your own wallets, so both keys have to be on this machine for it.
 """
 import base64
@@ -1008,6 +1009,14 @@ _APPROVE_FIELDS = (
     ("builder", "address"),
     ("nonce", "uint64"),
 )
+_SWITCH_TYPE = "HyperliquidTransaction:UserSetAbstraction"
+_SWITCH_FIELDS = (
+    ("hyperliquidChain", "string"),
+    ("user", "address"),
+    ("abstraction", "string"),
+    ("nonce", "uint64"),
+)
+UNIFIED_ABSTRACTION = "unifiedAccount"
 _SEND_TYPE = "HyperliquidTransaction:SendAsset"
 _SEND_FIELDS = (
     ("hyperliquidChain", "string"),
@@ -1122,6 +1131,45 @@ def builder_fee_digest(prepared):
     ):
         _refuse("the nonce of %s is not the one foom prepared" % what)
     return eip712_digest(_USER_DOMAIN, _APPROVE_TYPE, _APPROVE_FIELDS, message), nonce
+
+
+def unified_account_digest(prepared, mine, now_ms):
+    """The digest and nonce of the switch to a unified account foom prepared.
+
+    It sets this machine's own Ethereum wallet (mine) to unifiedAccount on
+    Hyperliquid mainnet, with the nonce the same answer states, within ten
+    minutes of this machine's clock (now_ms).
+    """
+    what = "the switch to a unified account"
+    prepared = _object(prepared, what)
+    if prepared.get("status") != "switch_required":
+        _refuse("foom did not answer with a switch to sign")
+    message = _typed_message(
+        prepared.get("typed_data"), _USER_DOMAIN, _SWITCH_TYPE, _SWITCH_FIELDS, what
+    )
+    names = [name for name, _ in _SWITCH_FIELDS]
+    if sorted(message) != sorted(names):
+        _refuse(
+            "the message of %s does not hold exactly the fields %s"
+            % (what, ", ".join(names))
+        )
+    if message["hyperliquidChain"] != HL_CHAIN:
+        _refuse("%s is not for Hyperliquid mainnet" % what)
+    if not same_address(message["user"], mine):
+        _refuse(
+            "%s names another wallet than %s, the wallet of the Ethereum key on this machine"
+            % (what, mine)
+        )
+    if message["abstraction"] != UNIFIED_ABSTRACTION:
+        _refuse("%s sets another mode than %s" % (what, UNIFIED_ABSTRACTION))
+    nonce = prepared.get("nonce")
+    if not _is_int(nonce) or not _is_int(message["nonce"]) or message["nonce"] != nonce:
+        _refuse("the nonce of %s is not the one foom prepared" % what)
+    if abs(nonce - now_ms) > MAX_EXPIRES_AHEAD_MS:
+        _refuse(
+            "the nonce of %s is not within ten minutes of this machine's clock" % what
+        )
+    return eip712_digest(_USER_DOMAIN, _SWITCH_TYPE, _SWITCH_FIELDS, message), nonce
 
 
 def _held_margin_mode(market_id, positions):
@@ -1773,6 +1821,8 @@ def keygen():
 MCP = "https://foomfamily.ai/mcp"
 TOOL_PREPARE_FEE = "prepare_builder_fee_approval"
 TOOL_EXECUTE_FEE = "execute_builder_fee_approval"
+TOOL_PREPARE_UNIFIED = "prepare_unified_account"
+TOOL_EXECUTE_UNIFIED = "execute_unified_account"
 # The waits read the same settings as the spot recipe.
 POLL_SECONDS = float(os.environ.get("FOOM_TRADE_POLL_SECONDS", "3"))
 MAX_WAIT_SECONDS = float(os.environ.get("FOOM_TRADE_MAX_WAIT_SECONDS", "180"))
@@ -2071,6 +2121,139 @@ def approve_builder_fee():
         "The builder fee (%s) is approved for %s. You can execute perp proposals now."
         % (FEE_RATE, address)
     )
+    return 0
+
+
+# --- switch-to-unified --------------------------------------------------------------
+
+SWITCH_WAIT_CODES = ("agent_hl_read_ceiling", "rate_limited")
+SWITCH_SAFE = (
+    " It is safe to repeat: prepare_unified_account answers unified if the switch "
+    "did land."
+)
+SWITCH_NEXT = {
+    "perps_cash_required": " Move money into Perps cash first (transfer to-perps), "
+    "then run this again.",
+}
+SWITCH_RESIGNED = (
+    " Nothing new was signed: the switch signed before expired before foom relayed it."
+)
+SWITCH_UNCHANGED = (
+    "perps_cash_required",
+    "unified_account_not_eligible",
+    "invalid_signature",
+    "unified_account_switch_failed",
+)
+
+
+def code_of(refusal):
+    return refusal.get("error") if isinstance(refusal, dict) else None
+
+
+def _switch_refused(refusal, doing, after):
+    """The text a switch refusal stops with: foom's answer, the next step, then after."""
+    code = code_of(refusal)
+    text = "ERROR: " + refusal_text(refusal, doing) + SWITCH_NEXT.get(code, "")
+    if code in SWITCH_WAIT_CODES:
+        wait = _positive(refusal.get("retry_after_seconds"), None)
+        if wait is None or wait <= MAX_READ_LIMIT_WAIT_SECONDS:
+            text += " Run this again in a minute."
+    return text + after
+
+
+def _switch_call(name, arguments, waits):
+    """Call one of the two switch tools. While foom answers agent_hl_read_ceiling or
+    rate_limited, wait the seconds it names and send the very same arguments again,
+    at most three times in the whole run. Returns (result, refusal) like mcp_call."""
+    while True:
+        result, refusal = mcp_call(name, arguments)
+        code = refusal.get("error") if isinstance(refusal, dict) else None
+        if code not in SWITCH_WAIT_CODES:
+            return result, refusal
+        wait = _positive(
+            refusal.get("retry_after_seconds"), MAX_READ_LIMIT_WAIT_SECONDS
+        )
+        if wait > MAX_READ_LIMIT_WAIT_SECONDS or waits[0] >= MAX_READ_LIMIT_WAITS:
+            return result, refusal
+        waits[0] += 1
+        print(
+            "foom answered %s to %s; waiting %g s, then sending the same request again "
+            "(wait %d of %d)." % (code, name, wait, waits[0], MAX_READ_LIMIT_WAITS)
+        )
+        sys.stdout.flush()
+        time.sleep(wait)
+
+
+def switch_to_unified():
+    """Switch this account's Ethereum trading wallet to a unified account on
+    Hyperliquid mainnet, once."""
+    seed = need_evm_seed()
+    need_deva_key()
+    address = evm_address(seed)
+    waits = [0]
+    prepared_again = False
+    while True:
+        prepared, refusal = _switch_call(TOOL_PREPARE_UNIFIED, {}, waits)
+        if refusal is not None:
+            raise SystemExit(
+                _switch_refused(
+                    refusal,
+                    "prepare the switch to a unified account",
+                    (SWITCH_RESIGNED if prepared_again else " Nothing was signed.")
+                    + ("" if code_of(refusal) in SWITCH_UNCHANGED else SWITCH_SAFE),
+                )
+            )
+        if need(prepared, "status", TOOL_PREPARE_UNIFIED) == "unified":
+            print("The account of %s is already unified. Nothing to sign." % address)
+            return 0
+        try:
+            digest, nonce = unified_account_digest(
+                prepared, address, int(time.time() * 1000)
+            )
+        except SystemExit as stop:
+            if prepared_again and isinstance(stop.code, str):
+                raise SystemExit(
+                    stop.code.replace(" Nothing was signed.", SWITCH_RESIGNED)
+                )
+            raise
+        signature = sig_hex(ecdsa_sign(seed, digest))
+        result, refusal = _switch_call(
+            TOOL_EXECUTE_UNIFIED,
+            {"proposal": {"nonce": nonce, "signature": signature}},
+            waits,
+        )
+        if refusal is None:
+            break
+        code = refusal.get("error") if isinstance(refusal, dict) else None
+        if code == "preparation_expired" and not prepared_again:
+            prepared_again = True
+            print(
+                "The signed switch expired before foom relayed it; preparing and "
+                "signing it once more."
+            )
+            continue
+        if code in SWITCH_UNCHANGED:
+            after = " Nothing changed."
+        elif code in SWITCH_WAIT_CODES:
+            after = SWITCH_SAFE
+        else:
+            after = " Run this again." + SWITCH_SAFE
+        raise SystemExit(
+            _switch_refused(refusal, "switch the account to unified", after)
+        )
+    if need(result, "status", TOOL_EXECUTE_UNIFIED) != "unified":
+        raise SystemExit(
+            "ERROR: unrecognised answer from %s (status %r). Call "
+            "prepare_unified_account, or run this again, to see whether the switch "
+            "landed." % (TOOL_EXECUTE_UNIFIED, result.get("status"))
+        )
+    if result.get("relayed") is False:
+        print("The account of %s was already unified. Nothing changed." % address)
+    else:
+        print(
+            "The account of %s is unified: the same Perps cash now backs positions on "
+            "the native markets and on xyz markets together." % address
+        )
     return 0
 
 
@@ -3004,6 +3187,10 @@ def main(argv):
         if rest:
             raise SystemExit("usage: foom_perps.py approve-builder-fee")
         return approve_builder_fee()
+    if command == "switch-to-unified":
+        if rest:
+            raise SystemExit("usage: foom_perps.py switch-to-unified")
+        return switch_to_unified()
     raise SystemExit(
         "unknown command %r; see the docstring at the top of this file." % command
     )

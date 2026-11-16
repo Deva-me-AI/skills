@@ -273,7 +273,23 @@ and you move USDC between them yourself.
    that approved it. Do this after step 2: a wallet that never held money on Hyperliquid is
    refused with `perps_cash_required`. A proposal refused with `builder_fee_not_approved` means
    this step is missing.
-4. **Propose.** `propose_trade` with `venue: "perp"`:
+4. **Switch to a unified account, once.** `python3 scripts/foom_perps.py switch-to-unified`.
+   On a unified account one Perps cash balance margins the native markets and builder-dex
+   markets such as `xyz-nvda-perp` together; on a standard account an order on such a market is
+   refused for margin. Run it after steps 2 and 3: a wallet that never held money on Hyperliquid
+   is refused with `perps_cash_required`. It asks foom to prepare the switch
+   (`prepare_unified_account`), checks that the message sets your own Ethereum trading wallet to
+   `unifiedAccount` on Hyperliquid mainnet with the nonce foom states, that nonce within ten
+   minutes of your machine's clock, signs it and sends it
+   (`execute_unified_account`). On an account that already is unified there is nothing to sign.
+   It is safe to re-run. Right after step 3 foom often answers `agent_hl_read_ceiling` (or
+   `rate_limited`): the recipe waits the seconds foom names, when that is a minute or less, and
+   sends the same request again, up to three times; once it has signed, that is the same
+   signature, so waiting never signs a new message. On `preparation_expired` it prepares and
+   signs once more. An account opened earlier: run it once, while it holds no perp position and
+   no open order; otherwise foom answers `unified_account_not_eligible`, and its `reason` says
+   why. Native perps keep working on a standard account.
+5. **Propose.** `propose_trade` with `venue: "perp"`:
 
    ```json
    {"idempotency_key": "<a new key for each proposal>", "proposal": {"market_id": "btc-perp",
@@ -285,11 +301,14 @@ and you move USDC between them yourself.
    limit order answers `order_type_not_supported`. An order is worth at least $10. Leverage is
    capped at 3x until you raise `max_leverage` with `set_agent_policy`, and never goes above the
    market's own maximum; `leverage_cap` says which bound refused you. `insufficient_margin` means
-   Perps cash does not cover the order. Slippage is at most 1,000 bps (10%). The recipe checks
-   the price bound against that slippage plus a 5% allowance for movement since the proposal.
+   Perps cash does not cover the order. `insufficient_margin` with `reason: "standard_account"`
+   means the order is on a builder-dex market and your account is in standard mode: run step 4,
+   then propose again with a new idempotency key. Slippage is at most 1,000 bps (10%). The
+   recipe checks the price bound against that slippage plus a 5% allowance for movement since
+   the proposal.
    A leverage change keeps the margin mode of a position you already hold on that market. To
    close or shrink a position, propose the opposite side for the size to take off.
-5. **Execute.** `python3 scripts/foom_perps.py execute <proposal id>` asks foom to prepare the
+6. **Execute.** `python3 scripts/foom_perps.py execute <proposal id>` asks foom to prepare the
    order, checks it against your own proposal and the market (asset, side, size, price bound,
    fee), signs it and waits for `filled` or `failed`. It is safe to re-run: nothing is signed
    twice. `partial_leverage_only` means the leverage change landed and the order did not run;
@@ -306,7 +325,7 @@ and you move USDC between them yourself.
    answers `agent_hl_read_ceiling` (its per-minute limit on Hyperliquid reads for agents)
    before a prepare, the recipe waits for the next minute and asks again, up to three times for the whole run; if it
    still stops there, run it again a minute later.
-6. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2). It
+7. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2). It
    signs only when Relay's order pays your own wallet, so it needs your Solana trading key on
    this machine as well (`~/.deva/trading.key`, or `--solana-key-file <path>` before the command).
    How much: call `get_positions` right before the move and ask for at most its
@@ -334,16 +353,19 @@ One transfer at a time: while one is unfinished, the recipe finishes it before i
 says the review is over, run `python3 scripts/foom_perps.py transfer forget <request id>`.
 
 The recipe signs only these with your Ethereum key: the wallet challenge; the fee approval at
-exactly 0.05%; an order that matches your own proposal, with the leverage change your proposal
+exactly 0.05%; the switch of your own wallet to a unified account on Hyperliquid mainnet; an
+order that matches your own proposal, with the leverage change your proposal
 asks for; and the two messages that move the amount you asked for to Relay's depository, for
 an order of Relay's that pays your own wallets. Anything else is refused before a signature
 exists, and foom checks every signed message again on its side.
 
 **Risk.** Leverage multiplies losses as well as gains. Positions use cross margin unless you
 changed that on Hyperliquid yourself: all of your Perps cash backs every position, and a
-liquidation can take all of it. Keep in Perps cash only what you are ready to lose, and watch
-`get_positions`, which shows each position's liquidation price. If foom halts agent accounts, no
-order goes through foom, closing ones included, while Hyperliquid keeps marking your positions.
+liquidation can take all of it. On a unified account the same Perps cash backs positions on the
+native markets and on `xyz` markets together, so a loss on one can liquidate the other. Keep
+in Perps cash only what you are ready to lose, and watch `get_positions`, which shows each
+position's liquidation price. If foom halts agent accounts, no order goes through foom,
+closing ones included, while Hyperliquid keeps marking your positions.
 Your key also works on Hyperliquid directly, so you can always close there; orders placed that
 way carry no foom fee and earn no BIP.
 
