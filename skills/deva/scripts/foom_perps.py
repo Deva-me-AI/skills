@@ -2814,6 +2814,103 @@ def _signing_address(direction):
     return evm_address(need_evm_seed())
 
 
+# The cost lines of foom's quote, named as foom's app names them to a person.
+_COST_LABELS = {
+    "origin_network": "network fee",
+    "destination_network": "network fee",
+    "relayer_service": "transfer service",
+    "relayer": "transfer service",
+    "app": "foom fee",
+    "subsidized": "covered by foom",
+}
+SOL_DECIMALS = 9
+
+
+def _quoted_cost(money):
+    """A money object of foom's quote as (the number, whether it is SOL), or None
+    when it is not the {amount, decimals, chain} this recipe knows. Every cost is
+    in USDC but the Solana network fee, which is in SOL."""
+    if not isinstance(money, dict):
+        return None
+    amount, decimals = money.get("amount"), money.get("decimals")
+    if (
+        not isinstance(amount, str)
+        or not amount
+        or any(c not in _DIGITS for c in amount)
+        or type(decimals) is not int
+        or not 0 <= decimals <= 18
+        or not isinstance(money.get("chain"), str)
+    ):
+        return None
+    in_sol = money["chain"] == "solana" and decimals == SOL_DECIMALS
+    return decimal.Decimal(amount).scaleb(-decimals), in_sol
+
+
+def _one_time_label(direction, leg):
+    """Whose one-time fee a line is: Hyperliquid's on the way in and on its own leg
+    of the way out, the Solana token account's otherwise."""
+    if direction == "to-perps" or leg == "hypercore_sendasset":
+        return "one-time Hyperliquid activation fee"
+    return "one-time Solana token account fee"
+
+
+def _print_costs(quote, direction, amount_usd):
+    """Say the costs foom's quote lists for the transfer, and warn when the
+    one-time account fees are more than a tenth of the amount."""
+    fees, activation = quote.get("fees"), quote.get("activation")
+    lines, one_time, said = [], decimal.Decimal(0), set()
+    for fee in fees if isinstance(fees, list) else []:
+        kind = fee.get("kind") if isinstance(fee, dict) else None
+        cost = _quoted_cost(fee.get("amount")) if isinstance(kind, str) else None
+        if cost is None:
+            continue
+        value, in_sol = cost
+        label = _COST_LABELS.get(kind)
+        if kind == "account_creation":
+            label = _one_time_label(direction, fee.get("leg"))
+            if not in_sol:
+                one_time += value
+            if fee.get("leg") != "hypercore_sendasset":
+                money = fee["amount"]
+                said.add((money["amount"], money["decimals"], money["chain"]))
+        text = "%s SOL" % _dollars(value) if in_sol else "$" + _dollars(value)
+        lines.append("%s: %s" % ("%s (%s)" % (label, kind) if label else kind, text))
+    # The activation is one of the lines above when foom charges it in the quote;
+    # it is said here only when no line carries that same money.
+    applies = isinstance(activation, dict) and activation.get("applies") is True
+    money = activation.get("amount") if applies else None
+    cost = _quoted_cost(money)
+    if (
+        cost is not None
+        and not cost[1]
+        and (money["amount"], money["decimals"], money["chain"]) not in said
+    ):
+        one_time += cost[0]
+        lines.append(
+            "%s (activation): $%s"
+            % (_one_time_label(direction, None), _dollars(cost[0]))
+        )
+    if not lines:
+        return
+    print(
+        "foom's quote lists these costs for moving $%s to %s:"
+        % (amount_usd, _BALANCE[direction])
+    )
+    for line in lines:
+        print("  " + line)
+    amount = decimal.Decimal(amount_usd)
+    if one_time * 10 > amount:
+        print(
+            "WARNING: one-time account fees are $%s, %g%% of this $%s move. "
+            "They are charged once per account."
+            % (
+                _dollars(one_time),
+                round(float(one_time * 100 / amount), 1),
+                amount_usd,
+            )
+        )
+
+
 def _quote_and_sign(state):
     """Ask for the quote on the stored key, check it, sign it, and record the submission."""
     direction, amount = state["direction"], state["amount_usd"]
@@ -2875,6 +2972,7 @@ def _quote_and_sign(state):
                 "who this transfer pays. Nothing was signed. Run the transfer again for a "
                 "new quote."
             )
+        _print_costs(quote, direction, amount)
         submission, address, minimum, expected = _sign_transfer(
             direction, amount, payload, order
         )
