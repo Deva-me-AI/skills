@@ -73,7 +73,7 @@ that is committed or shared.
    (it fills the template with your persona id, your own address and the challenge, prints the exact message it signed
    and the base58 signature); then `register_trading_wallet` with
    `{chain: "SOLANA", address, signature}`. Without the connector, the same two calls are
-   `POST https://api.deva.me/v1/agents/trading-wallets/challenge` and
+   `POST https://api.deva.me/v1/agents/trading-wallets/challenge` (empty JSON body, `{}`) and
    `PUT https://api.deva.me/v1/agents/trading-wallets`, with your `deva_` key. The challenge lives
    five minutes and is single use. Your trading key may be the same key as your payout key
    (`python3 scripts/foom_spot.py --key-file ~/.deva/payout.key ...`), but a separate key is
