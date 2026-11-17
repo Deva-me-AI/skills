@@ -2100,6 +2100,18 @@ def _again_in_a_minute(refusal):
     return ""
 
 
+FEE_MISS_REASONS = ("solana_fee_unavailable", "solana_rpc_unavailable")
+
+
+def _fee_miss(refusal):
+    return (
+        isinstance(refusal, dict)
+        and refusal.get("error") in ("quote_unavailable", "funding_failed")
+        and refusal.get("reason") in FEE_MISS_REASONS
+        and not refusal.get("request_id")
+    )
+
+
 def _call_waiting(name, arguments, waits):
     """Call a setup tool. While foom answers agent_hl_read_ceiling or rate_limited,
     wait the seconds it names and send the very same arguments again, at most three
@@ -2915,20 +2927,35 @@ def _quote_and_sign(state):
     """Ask for the quote on the stored key, check it, sign it, and record the submission."""
     direction, amount = state["direction"], state["amount_usd"]
     tries = 0
+    waits = [0]
+    fee_misses = 0
     while True:
         tries += 1
-        result, refusal = mcp_call(
+        result, refusal = _call_waiting(
             TOOL_QUOTE,
             {
                 "proposal": {"direction": _DIRECTIONS[direction], "amount_usd": amount},
                 "idempotency_key": state["quote_key"],
             },
+            waits,
         )
-        if (
-            refusal is None
-            or refusal.get("error") != "quote_unavailable"
-            or tries >= MAX_PREPARES
-        ):
+        if refusal is None or tries >= MAX_PREPARES:
+            break
+        if _fee_miss(refusal):
+            fee_misses += 1
+            if fee_misses > 1:
+                break
+            wait = _positive(refusal.get("retry_after_seconds"), QUOTE_WAIT_SECONDS)
+            if wait > MAX_QUOTE_WAIT_SECONDS:
+                break
+            print(
+                "foom could not read the Solana network fee just now (%s); asking once "
+                "more on the same request in %g s." % (refusal.get("reason"), wait)
+            )
+            sys.stdout.flush()
+            time.sleep(wait)
+            continue
+        if refusal.get("error") != "quote_unavailable":
             break
         wait = _positive(refusal.get("retry_after_seconds"), QUOTE_WAIT_SECONDS)
         if wait > MAX_QUOTE_WAIT_SECONDS:
@@ -2941,11 +2968,27 @@ def _quote_and_sign(state):
     if refusal is not None:
         # Nothing was quoted, so nothing is in flight: the next run starts afresh.
         clear_state("transfer", "current")
-        raise SystemExit(
-            "ERROR: "
-            + refusal_text(refusal, "quote the transfer")
-            + " Nothing was signed."
+        fee_miss = _fee_miss(refusal)
+        shown = (
+            {k: v for k, v in refusal.items() if k != "message"}
+            if fee_miss
+            else refusal
         )
+        text = refusal_text(shown, "quote the transfer") + " Nothing was signed."
+        if fee_miss:
+            wait = _positive(refusal.get("retry_after_seconds"), None)
+            text += (
+                " No transfer was created, so there is nothing to read with "
+                "get_agent_transfer: run the same command again %s."
+                % (
+                    "after that wait"
+                    if wait and wait > MAX_QUOTE_WAIT_SECONDS
+                    else "in a minute"
+                )
+            )
+        else:
+            text += _again_in_a_minute(refusal)
+        raise SystemExit("ERROR: " + text)
     quote = need(result, "quote", TOOL_QUOTE)
     request_id, payload = need(quote, "request_id", TOOL_QUOTE), need(
         quote, "payload", TOOL_QUOTE
