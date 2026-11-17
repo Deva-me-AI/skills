@@ -116,7 +116,7 @@ Send both of these to your trading wallet address, on Solana:
   Keep some SOL even when you only hold USDC: a proposal the wallet cannot cover in SOL is refused
   with `insufficient_sol`. A buy refused with `sponsor_refused` while the wallet is low on SOL has
   the same cause: add SOL, then propose again.
-- **USDC** for buys. A buy is at least $3 of USDC (the fee floor); a sell is at least $2.
+- **USDC** for buys. A buy spends at least $3 of USDC, the foom fee included; a sell is at least $2.
 
 Nothing is sponsored: the trade, the foom fee, the network fees and any rent all come out of this
 wallet. Funding the wallet is crypto only; the card route in SKILL.md funds your Deva key, not the
@@ -128,6 +128,15 @@ Check that the funds arrived before you propose. Both reads below come from the 
   lamports, `quantity_decimal` in SOL), next to the other non-USDC tokens the wallet holds. No
   `native-sol` row means 0 SOL. Send native SOL, not wrapped SOL: SOL sells spend native SOL.
 - `get_portfolio` shows your USDC as `cash.tokens_usd`.
+
+On these balance reads (`get_portfolio`, `get_positions`, `get_pnl`), `stale: true` means a price
+in the answer may be old, or of unknown age. The balances themselves come from the wallet. A
+token foom cannot price has a null price; that does not make the answer stale. The profit and
+loss totals are null when foom does not know what your tokens cost,
+and `cost_basis` then says `incomplete` (always, today, for tokens in your own wallet): that is
+no reason to distrust the balances. An older foom answers `stale: true` on every balance read and
+sends no `cost_basis`; there, too, the balances are current. `stale` on `get_market` is different:
+it means that market's price is old.
 
 An `insufficient_sol` refusal from `propose_trade` may include `balance_lamports`, the SOL balance
 foom read (over REST and through the connector). When it is missing, read the `native-sol` row.
@@ -164,6 +173,28 @@ Before each proposal, read the market with `get_market` and decide on its `quote
 refusal. An older foom answers `tradable: false` without `quote_status`: read that as `unknown`.
 That rule is for `get_market` only. A row in `get_positions` with `tradable: false` is a token
 foom has no market for, and it cannot be sold here.
+
+**The foom fee.** Every spot trade pays foom a fee in USDC, in the same transaction. On a buy it
+comes on top of `quote_amount`, so a $3 buy of SOL spends $3.50; on a sell it comes out of the
+USDC the sale returns. The fee depends on the token and the size of the trade (on a buy,
+`quote_amount` plus the fee; on a sell, the USDC the sale returns):
+
+| Token | Trade size | foom fee |
+|---|---|---|
+| SOL, JUP, BTC and ETH (Portal) | under $1,000 | $0.50 flat |
+| | $1,000 and above | 0.05% |
+| Every other token | under $5 | $0.10 flat |
+| | $5 to under $47.50 | 2% |
+| | $47.50 to under $190 | $0.95 flat |
+| | $190 and above | 0.5% |
+
+On a small trade a flat fee is a large share: a $3 round trip on SOL pays $1.00 in fees, a third
+of the money moved. Choose the size with that in mind. The answer of `propose_trade`, and
+`get_proposal` while the proposal is `pending`, give the fee of that proposal as
+`summary.foom_fee_usd` (USDC), before anything is signed. That value is the one charged: when it
+differs from the table, it wins. If the trade is not worth its fee, withdraw it with
+`cancel_proposal` instead of executing. After the fill, `execution_result.foom_fee_usd` is the fee
+paid. An older foom does not send `foom_fee_usd`: use the table.
 
 Then:
 
