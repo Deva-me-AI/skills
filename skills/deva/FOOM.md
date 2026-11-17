@@ -295,8 +295,13 @@ and you move USDC between them yourself.
    `open_foom_account` again, with no arguments: it adds the wallet to your open account. Until
    then the perps tools answer `ethereum_wallet_required`.
 2. **Move money in.** `python3 scripts/foom_perps.py transfer to-perps 25` moves $25 of Token cash
-   to Perps cash (at least $5; your Solana wallet pays the network fee in SOL). It asks foom for a
-   quote, checks it, signs with your Solana trading key and waits until the money has arrived.
+   to Perps cash (at least $5; your Solana wallet pays the network fee in SOL). A wallet's first
+   move in also pays Hyperliquid's one-time activation fee, about $1.20 through Relay today (the
+   quote states the amount): it comes out of the amount, so $5 arrives as about $3.80. Size the
+   first move with that in mind: an order is worth at least $10 (step 5). The recipe asks foom
+   for a quote, prints every cost the quote lists, checks it, signs with your Solana trading key
+   and waits until the money has arrived. When the one-time fee is more than 10% of the amount,
+   it prints a warning and goes on.
    It signs only when Relay's order pays your own wallet: the money lands in Perps cash under
    your Ethereum trading wallet, so both keys have to be on this machine.
 3. **Approve the fee, once per wallet.** `python3 scripts/foom_perps.py approve-builder-fee`.
@@ -358,6 +363,7 @@ and you move USDC between them yourself.
    before a prepare, the recipe waits for the next minute and asks again, up to three times for the whole run; if it
    still stops there, run it again a minute later.
 7. **Move money back.** `python3 scripts/foom_perps.py transfer to-cash 25` (at least $2). It
+   prints every cost the quote lists, as in step 2. It
    signs only when Relay's order pays your own wallet, so it needs your Solana trading key on
    this machine as well (`~/.deva/trading.key`, or `--solana-key-file <path>` before the command).
    How much: call `get_positions` right before the move and ask for at most its
@@ -372,7 +378,8 @@ and you move USDC between them yourself.
    be moved out now: read `get_positions` again and ask for less. Reason
    `perps_balance_insufficient_first_transfer_fee` means Hyperliquid takes its
    one-time activation fee (1 USDC today) on this wallet's first move out, on top of the amount;
-   only a wallet first funded some other way than `transfer to-perps` pays it there. Ask for
+   only a wallet first funded some other way than `transfer to-perps` pays it there: one funded
+   by `transfer to-perps` paid that fee on its first move in (step 2). Ask for
    at least that fee less than `perps_withdrawable_usd`. When it is below $2 (or below
    $2 plus that fee when the fee applies), nothing can be moved yet. Both reasons can also come
    after the transfer was signed, when foom runs it: nothing moved, and the recipe keeps the
