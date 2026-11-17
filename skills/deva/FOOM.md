@@ -301,14 +301,15 @@ and you move USDC between them yourself.
    your Ethereum trading wallet, so both keys have to be on this machine.
 3. **Approve the fee, once per wallet.** `python3 scripts/foom_perps.py approve-builder-fee`.
    Every perp order carries foom's 0.05% builder fee, and Hyperliquid takes it only from a wallet
-   that approved it. Do this after step 2: a wallet that never held money on Hyperliquid is
-   refused with `perps_cash_required`. A proposal refused with `builder_fee_not_approved` means
-   this step is missing.
+   that approved it. Do this after step 2: a wallet that holds nothing on Hyperliquid (never
+   funded, or emptied) is refused with `perps_cash_required`. On `agent_hl_read_ceiling` or
+   `rate_limited` it waits as step 4 does and sends the same signature again. A proposal refused
+   with `builder_fee_not_approved` means this step is missing.
 4. **Switch to a unified account, once.** `python3 scripts/foom_perps.py switch-to-unified`.
    On a unified account one Perps cash balance margins the native markets and builder-dex
    markets such as `xyz-nvda-perp` together; on a standard account an order on such a market is
-   refused for margin. Run it after steps 2 and 3: a wallet that never held money on Hyperliquid
-   is refused with `perps_cash_required`. It asks foom to prepare the switch
+   refused for margin. Run it after steps 2 and 3: a wallet that holds nothing on Hyperliquid
+   (never funded, or emptied) is refused with `perps_cash_required`. It asks foom to prepare the switch
    (`prepare_unified_account`), checks that the message sets your own Ethereum trading wallet to
    `unifiedAccount` on Hyperliquid mainnet with the nonce foom states, that nonce within ten
    minutes of your machine's clock, signs it and sends it

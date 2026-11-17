@@ -2081,7 +2081,54 @@ def clear_state(kind, ident):
         pass
 
 
+# --- waiting while foom's Hyperliquid reads are busy ----------------------------------
+
+WAIT_CODES = ("agent_hl_read_ceiling", "rate_limited")
+
+
+def code_of(refusal):
+    return refusal.get("error") if isinstance(refusal, dict) else None
+
+
+def _again_in_a_minute(refusal):
+    """' Run this again in a minute.' when foom answered a busy code with a wait of a
+    minute or less (or none); a longer wait is already named in foom's own text."""
+    if code_of(refusal) in WAIT_CODES:
+        wait = _positive(refusal.get("retry_after_seconds"), None)
+        if wait is None or wait <= MAX_READ_LIMIT_WAIT_SECONDS:
+            return " Run this again in a minute."
+    return ""
+
+
+def _call_waiting(name, arguments, waits):
+    """Call a setup tool. While foom answers agent_hl_read_ceiling or rate_limited,
+    wait the seconds it names and send the very same arguments again, at most three
+    times in the whole run. Returns (result, refusal) like mcp_call."""
+    while True:
+        result, refusal = mcp_call(name, arguments)
+        code = code_of(refusal)
+        if code not in WAIT_CODES:
+            return result, refusal
+        wait = _positive(
+            refusal.get("retry_after_seconds"), MAX_READ_LIMIT_WAIT_SECONDS
+        )
+        if wait > MAX_READ_LIMIT_WAIT_SECONDS or waits[0] >= MAX_READ_LIMIT_WAITS:
+            return result, refusal
+        waits[0] += 1
+        print(
+            "foom answered %s to %s; waiting %g s, then sending the same request again "
+            "(wait %d of %d)." % (code, name, wait, waits[0], MAX_READ_LIMIT_WAITS)
+        )
+        sys.stdout.flush()
+        time.sleep(wait)
+
+
 # --- approve-builder-fee -------------------------------------------------------------
+
+FEE_SAFE = (
+    " It is safe to repeat: prepare_builder_fee_approval answers approved if the "
+    "approval did land."
+)
 
 
 def approve_builder_fee():
@@ -2089,11 +2136,13 @@ def approve_builder_fee():
     seed = need_evm_seed()
     need_deva_key()
     address = evm_address(seed)
-    prepared, refusal = mcp_call(TOOL_PREPARE_FEE, {})
+    waits = [0]
+    prepared, refusal = _call_waiting(TOOL_PREPARE_FEE, {}, waits)
     if refusal is not None:
         raise SystemExit(
             "ERROR: "
             + refusal_text(refusal, "prepare the builder-fee approval")
+            + _again_in_a_minute(refusal)
             + " Nothing was signed."
         )
     if need(prepared, "status", TOOL_PREPARE_FEE) == "approved":
@@ -2101,15 +2150,15 @@ def approve_builder_fee():
         return 0
     digest, nonce = builder_fee_digest(prepared)
     signature = sig_hex(ecdsa_sign(seed, digest))
-    result, refusal = mcp_call(
-        TOOL_EXECUTE_FEE, {"proposal": {"nonce": nonce, "signature": signature}}
+    result, refusal = _call_waiting(
+        TOOL_EXECUTE_FEE, {"proposal": {"nonce": nonce, "signature": signature}}, waits
     )
     if refusal is not None:
+        again = _again_in_a_minute(refusal)
         raise SystemExit(
             "ERROR: "
             + refusal_text(refusal, "relay the builder-fee approval")
-            + " Run this again: it is safe "
-            "to repeat, and it answers approved if the approval did land."
+            + (again + FEE_SAFE if again else " Run this again." + FEE_SAFE)
         )
     if need(result, "status", TOOL_EXECUTE_FEE) != "approved":
         raise SystemExit(
@@ -2126,7 +2175,6 @@ def approve_builder_fee():
 
 # --- switch-to-unified --------------------------------------------------------------
 
-SWITCH_WAIT_CODES = ("agent_hl_read_ceiling", "rate_limited")
 SWITCH_SAFE = (
     " It is safe to repeat: prepare_unified_account answers unified if the switch "
     "did land."
@@ -2146,42 +2194,15 @@ SWITCH_UNCHANGED = (
 )
 
 
-def code_of(refusal):
-    return refusal.get("error") if isinstance(refusal, dict) else None
-
-
 def _switch_refused(refusal, doing, after):
     """The text a switch refusal stops with: foom's answer, the next step, then after."""
-    code = code_of(refusal)
-    text = "ERROR: " + refusal_text(refusal, doing) + SWITCH_NEXT.get(code, "")
-    if code in SWITCH_WAIT_CODES:
-        wait = _positive(refusal.get("retry_after_seconds"), None)
-        if wait is None or wait <= MAX_READ_LIMIT_WAIT_SECONDS:
-            text += " Run this again in a minute."
-    return text + after
-
-
-def _switch_call(name, arguments, waits):
-    """Call one of the two switch tools. While foom answers agent_hl_read_ceiling or
-    rate_limited, wait the seconds it names and send the very same arguments again,
-    at most three times in the whole run. Returns (result, refusal) like mcp_call."""
-    while True:
-        result, refusal = mcp_call(name, arguments)
-        code = refusal.get("error") if isinstance(refusal, dict) else None
-        if code not in SWITCH_WAIT_CODES:
-            return result, refusal
-        wait = _positive(
-            refusal.get("retry_after_seconds"), MAX_READ_LIMIT_WAIT_SECONDS
-        )
-        if wait > MAX_READ_LIMIT_WAIT_SECONDS or waits[0] >= MAX_READ_LIMIT_WAITS:
-            return result, refusal
-        waits[0] += 1
-        print(
-            "foom answered %s to %s; waiting %g s, then sending the same request again "
-            "(wait %d of %d)." % (code, name, wait, waits[0], MAX_READ_LIMIT_WAITS)
-        )
-        sys.stdout.flush()
-        time.sleep(wait)
+    return (
+        "ERROR: "
+        + refusal_text(refusal, doing)
+        + SWITCH_NEXT.get(code_of(refusal), "")
+        + _again_in_a_minute(refusal)
+        + after
+    )
 
 
 def switch_to_unified():
@@ -2193,7 +2214,7 @@ def switch_to_unified():
     waits = [0]
     prepared_again = False
     while True:
-        prepared, refusal = _switch_call(TOOL_PREPARE_UNIFIED, {}, waits)
+        prepared, refusal = _call_waiting(TOOL_PREPARE_UNIFIED, {}, waits)
         if refusal is not None:
             raise SystemExit(
                 _switch_refused(
@@ -2217,7 +2238,7 @@ def switch_to_unified():
                 )
             raise
         signature = sig_hex(ecdsa_sign(seed, digest))
-        result, refusal = _switch_call(
+        result, refusal = _call_waiting(
             TOOL_EXECUTE_UNIFIED,
             {"proposal": {"nonce": nonce, "signature": signature}},
             waits,
@@ -2234,7 +2255,7 @@ def switch_to_unified():
             continue
         if code in SWITCH_UNCHANGED:
             after = " Nothing changed."
-        elif code in SWITCH_WAIT_CODES:
+        elif code in WAIT_CODES:
             after = SWITCH_SAFE
         else:
             after = " Run this again." + SWITCH_SAFE
