@@ -282,6 +282,14 @@ section runs through `scripts/foom_perps.py`. Read `get_agent_limits` first. `pe
 foom's switch for agent perps: while it is false, opening orders and moves into Perps cash are
 refused with `agent_perps_disabled`, and closing orders and moves back to Token cash still work.
 `builder_fee` says whether your Ethereum wallet has approved foom's fee (step 3).
+`builder_fee.status: "unavailable"` means foom could not read it just now (for example
+Hyperliquid did not answer, foom's per-minute limit on Hyperliquid reads for agents or your
+account's share of it was used up, your limits were already read 6 times in the last minute, or
+another money check of your account was running) or this deployment cannot offer the approval;
+it says nothing about the approval, and right after step 3 it is common. Do not approve again
+because of it: read `get_agent_limits` again in a minute. If it still reads `unavailable`
+minutes later, run step 3 again: it answers approved if the approval is already in place,
+approves it if not, or says why it cannot.
 
 Two balances: **Token cash** is the USDC in your Solana trading wallet, **Perps cash** is the USDC
 on Hyperliquid under your Ethereum trading wallet. Spot spends Token cash, perps use Perps cash,
@@ -386,6 +394,16 @@ and you move USDC between them yourself.
    signed transfer and finishes it before it starts another. Then
    run the same command again (it resends the same amount, which goes through if the balance
    came back); once it says the quote expired, read `get_positions` again and ask for less.
+
+**Waits on a transfer.** In both directions, when foom answers the quote with
+`agent_hl_read_ceiling` or `rate_limited`, the recipe waits the seconds foom names, when that is
+a minute or less, and asks again for the same quote, up to three times. When foom could not
+read the Solana network fee just now (reason `solana_fee_unavailable` or `solana_rpc_unavailable`,
+with `quote_unavailable`, or with `funding_failed` from an older foom), it asks once more after
+the wait foom names, when that is a minute or less (20 seconds when it names none). Nothing is
+signed before a quote arrives. If it still stops there, no transfer was created and there is
+nothing to read with `get_agent_transfer`: run the same command again in a minute, or once the
+wait foom named is over when that is longer.
 
 One transfer at a time: while one is unfinished, the recipe finishes it before it starts another.
 `manual_review` means part of a move ran and foom reviews it by hand. Do not repeat it; when foom
