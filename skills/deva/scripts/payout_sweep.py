@@ -36,6 +36,7 @@ CONFIRM_TIMEOUT_SECONDS = 10
 CUMULATIVE_LANE = "claim_cumulative"
 FEE_LANE = "claim_with_fee_deduction"
 SWEEP_LANES = (CUMULATIVE_LANE, FEE_LANE)
+BIP_DECIMALS = 9
 
 # This script signs nothing but the claim. The emission registry it claims from
 # is filled in when Deva serves this script (SKILL.md); a copy where it is still
@@ -434,6 +435,24 @@ def load_seed():
     return seed if len(seed) == 32 else None
 
 
+def bip(units, named=False):
+    """``units`` base units with its BIP figure beside it, e.g.
+    ``3500000 (0.0035 BIP)``, or ``3500000 BIP base units (0.0035 BIP)`` when
+    ``named``. A value that is not a whole number of base units is printed as
+    it came, with no BIP figure."""
+    label = " BIP base units" if named else ""
+    text = "%s" % (units,)
+    if isinstance(units, bool) or not (text.isascii() and text.isdigit()):
+        return text + label
+    whole, frac = divmod(int(text), 10**BIP_DECIMALS)
+    frac = ("%0*d" % (BIP_DECIMALS, frac)).rstrip("0")
+    return "%d%s (%s BIP)" % (
+        int(text),
+        label,
+        "%d.%s" % (whole, frac) if frac else whole,
+    )
+
+
 def is_stale(body):
     """A stale sweep epoch: content-server's array envelope, or a bare object."""
     if isinstance(body, list) and body and isinstance(body[0], dict):
@@ -486,10 +505,10 @@ def explain_below_minimum(body):
     if str(owed) == "0":
         return "Nothing to sweep - everything committed has already been settled."
     return (
-        "Not enough owed yet: %s BIP base units waiting, the minimum sweep is %s "
+        "Not enough owed yet: %s waiting, the minimum sweep is %s "
         "(the relay fee of %s comes out of it). Nothing was sent; rewards keep "
         "accumulating, run this again after a later seal."
-        % (owed, refusal.get("minimum"), refusal.get("fee"))
+        % (bip(owed, named=True), bip(refusal.get("minimum")), bip(refusal.get("fee")))
     )
 
 
@@ -555,7 +574,7 @@ def confirm_landed(committed, mine):
             print(
                 "Confirmed: this sweep landed. The claimable read now shows "
                 "claimed_total %s on the %s. Do not sweep again for it."
-                % (claimed, CHAIN)
+                % (bip(claimed), CHAIN)
             )
             return True
     print(
@@ -564,7 +583,7 @@ def confirm_landed(committed, mine):
         "landed once cumulative.claimed_total reaches %s. Do not sweep again "
         "before then, and do not look for it on Solana - it is on the %s. If "
         "it still shows owed a day later, run this recipe again."
-        % (API, committed, CHAIN)
+        % (API, bip(committed), CHAIN)
     )
     return False
 
@@ -621,6 +640,14 @@ def main():
         terms = body.get("claim_terms") if isinstance(body, dict) else None
         if not isinstance(cumulative, dict):
             print("Nothing on the cumulative lane yet - nothing to sweep.")
+            if isinstance(terms, dict) and body.get("claimant") == mine:
+                print(
+                    "Today a sweep runs on the agent fee lane: no karma and no "
+                    "credits; the relay fee of %s comes out of the BIP swept, "
+                    "and the minimum sweep is %s. Run this again after a seal "
+                    "credits you; it reads the terms again then."
+                    % (bip(terms.get("fee")), bip(terms.get("minimum")))
+                )
             return 0
         claimable_now = cumulative.get("claimable_now")
         if claimable_now is None:
@@ -693,7 +720,7 @@ def main():
                     "ERROR: refusing to sign - the relay fee %s is not below the "
                     "%s owed, so this sweep would pay you nothing. Nothing was "
                     "signed and nothing was spent. Tell your human."
-                    % (prep["fee"], claimable_now)
+                    % (bip(prep["fee"]), bip(claimable_now))
                 )
             # What lands in your wallet is prepare's own owed amount minus the
             # fee; a net that says otherwise is not the sweep being signed.
@@ -712,10 +739,10 @@ def main():
                     "but %s owed minus the %s fee is %s. Nothing was signed and "
                     "nothing was spent. Tell your human."
                     % (
-                        prep.get("net_amount"),
-                        prep.get("claimable_now"),
-                        prep["fee"],
-                        net,
+                        bip(prep.get("net_amount")),
+                        bip(prep.get("claimable_now")),
+                        bip(prep["fee"]),
+                        bip(net),
                     )
                 )
         if prep.get("claimant") != mine:
@@ -798,8 +825,9 @@ def main():
         if lane == FEE_LANE:
             swept = net
             print(
-                "Fee lane: %s BIP base units of relay fee come out of this sweep; "
-                "%s land in %s." % (prep.get("fee"), swept, mine)
+                "Fee lane: %s of relay fee come out of this sweep; "
+                "%s land in %s."
+                % (bip(prep.get("fee"), named=True), bip(swept, named=True), mine)
             )
 
         try:
@@ -856,8 +884,8 @@ def main():
             # claim lands). Only claim a sweep happened when the response actually
             # names the transaction.
             print(
-                "Swept %s BIP base units against epoch %s, into %s on the %s."
-                % (swept, epoch_id, mine, CHAIN)
+                "Swept %s against epoch %s, into %s on the %s."
+                % (bip(swept, named=True), epoch_id, mine, CHAIN)
             )
             print(
                 "Transaction: %s (on the %s, not Solana - a Solana RPC or "
