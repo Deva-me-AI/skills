@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.46.0
+version: 4.46.1
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -262,10 +262,10 @@ Every response also carries a `next` object naming the suggested follow-up call 
 
 **MCP** (one `tools/call` per step; the `arguments` object is shown):
 
-1. `list_resources` → `{"q": "news", "limit": 5}` → pick a slug, e.g. `apify.automation-lab.google-news-scraper`.
-2. `inspect_resource` → `{"slug": "apify.automation-lab.google-news-scraper"}` → read `input_schema`, `pricing`, and the cap flag (`cap_required` over MCP; `caps.max_total_charge_usd_required` over REST). **Build `params` from `input_schema` — field names vary per tool (this one uses `queries` + `maxArticles`; another may use `query` + `maxItems`), never copy them blind.**
-3. `run_resource` → `{"slug": "apify.automation-lab.google-news-scraper", "params": {"queries": ["artificial intelligence"], "maxArticles": 5}, "max_total_charge_credits": 0.5}` → `{"run_id": "run_abc123", "status": "running", "poll_tool": "get_run"}`.
-4. `get_run` → `{"run_id": "run_abc123"}` every 3-5s until `status` is `succeeded` (then `items` + `credits_charged` are set) or `failed`. This run returns ~5 real articles for ≈0.02 credits ($0.02).
+1. `list_resources` → `{"q": "news", "limit": 5}` → pick a slug, e.g. `apify.lhotanova.google-news-scraper`.
+2. `inspect_resource` → `{"slug": "apify.lhotanova.google-news-scraper"}` → read `input_schema`, `pricing`, and the cap flag (`cap_required` over MCP; `caps.max_total_charge_usd_required` over REST). **Build `params` from `input_schema`: this tool requires `query` + `language`; `maxItems` limits results. Other tools use different fields.**
+3. `run_resource` → `{"slug": "apify.lhotanova.google-news-scraper", "params": {"query": "artificial intelligence", "language": "US:en", "maxItems": 5}, "max_total_charge_credits": 0.5}` → `{"run_id": "run_abc123", "status": "running", "poll_tool": "get_run"}`.
+4. `get_run` → `{"run_id": "run_abc123"}` every 3-5s until `status` is `succeeded` (then `items` + `credits_charged` are set) or `failed`. Returns up to 5 articles; observed cost: 0.046 credits ($0.046), varying per run.
 5. `get_balance` → `{}` → remaining `total_spendable` (what you can still spend; it can stay flat after a billed run — see §6).
 
 **REST** (same loop, Bearer auth on every call):
@@ -273,15 +273,15 @@ Every response also carries a `next` object naming the suggested follow-up call 
 ```bash
 curl -s "https://api.deva.me/v1/agents/resources/discover?q=news&limit=5" \
   -H "Authorization: Bearer $DEVA_API_KEY"
-curl -s "https://api.deva.me/v1/agents/resources/inspect/apify.automation-lab.google-news-scraper" \
+curl -s "https://api.deva.me/v1/agents/resources/inspect/apify.lhotanova.google-news-scraper" \
   -H "Authorization: Bearer $DEVA_API_KEY"
-curl -s -X POST "https://api.deva.me/v1/agents/resources/run/apify.automation-lab.google-news-scraper" \
+curl -s -X POST "https://api.deva.me/v1/agents/resources/run/apify.lhotanova.google-news-scraper" \
   -H "Authorization: Bearer $DEVA_API_KEY" -H "Content-Type: application/json" \
-  -d '{"params": {"queries": ["artificial intelligence"], "maxArticles": 5}, "maxTotalChargeUsd": 0.5}'
+  -d '{"params": {"query": "artificial intelligence", "language": "US:en", "maxItems": 5}, "maxTotalChargeUsd": 0.5}'
 # -> 202 {"run_id": "run_abc123", "status": "running", "poll": "/v1/agents/resources/runs/run_abc123"}
 curl -s "https://api.deva.me/v1/agents/resources/runs/run_abc123" \
   -H "Authorization: Bearer $DEVA_API_KEY"
-# -> {"status": "succeeded", "run_id": "...", "credits_charged": 0.02, "result_count": 5, "items": [...]}
+# -> {"status": "succeeded", "run_id": "...", "credits_charged": 0.046, "result_count": 5, "items": [...]}
 ```
 
 ## 5. Run status & polling
