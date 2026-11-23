@@ -224,7 +224,7 @@ def signer_keys(raw):
     Parsed so the sweep can answer a question no server response can be trusted
     for: is this machine's own key actually a party to the transaction it is
     being asked to sign? A message that decodes cleanly but names someone else
-    is the one framing error that would otherwise cost gas.
+    is not this sweep, so it is refused before anything is signed.
     """
     required = raw[0]
     count, i = _shortvec(raw, 3)
@@ -506,8 +506,9 @@ def explain_below_minimum(body):
         return "Nothing to sweep - everything committed has already been settled."
     return (
         "Not enough owed yet: %s waiting, the minimum sweep is %s "
-        "(the relay fee of %s comes out of it). Nothing was sent; rewards keep "
-        "accumulating, run this again after a later seal."
+        "(the relay fee of %s comes out of it). Nothing was sent and nothing is "
+        "lost: it stays owed and grows with each later seal that credits you; "
+        "run this again after one."
         % (bip(owed, named=True), bip(refusal.get("minimum")), bip(refusal.get("fee")))
     )
 
@@ -518,12 +519,57 @@ PROGRESS_UNAVAILABLE_MESSAGE = (
 )
 
 
+def named_scopes(refusal):
+    """The scopes a 403 says the key lacks (check_agent_scopes' missing_scopes).
+
+    Only scope-shaped names are kept (PAYOUT:CLAIM, foom.trades.execute), so no
+    other server text is ever echoed as a scope; none named means no hint.
+    """
+    scopes = refusal.get("missing_scopes")
+    if not isinstance(scopes, list):
+        return []
+    return [
+        s
+        for s in scopes
+        if isinstance(s, str)
+        and 0 < len(s) <= 64
+        and all(c.isascii() and (c.isalnum() or c in "_:.*-") for c in s)
+    ]
+
+
+def is_sanctioned(body):
+    """A sanctions refusal: a claim's `code` (array envelope or bare), or the
+    agent-wide block every call on the key gets, which sits under `detail`."""
+    if _server_refusal(body).get("code") == "sanctioned_address":
+        return True
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return isinstance(detail, dict) and detail.get("code") == "sanctioned_address"
+
+
 def fail(status, body, what):
-    scope_hint = (
-        "\nmissing_scopes here means your key lacks PAYOUT:CLAIM - tell your human."
-        if status == 403
-        else ""
-    )
+    refusal = _server_refusal(body)
+    scope_hint = ""
+    if status == 403 and refusal.get("error") == "RPID_HALTED":
+        scope_hint = (
+            "\nRPID_HALTED is the relayer's kill switch: operators paused sweeps. "
+            "This is not a problem with your key or its scopes. Retry later; if "
+            "it lasts, tell your human."
+        )
+    elif status == 403 and is_sanctioned(body):
+        scope_hint = (
+            "\nsanctioned_address: a sanctions block on this agent or its payout "
+            "address; do not retry, tell your human."
+        )
+    elif status == 403 and refusal.get("error") == "agent_not_claimed":
+        scope_hint = (
+            "\nagent_not_claimed: no human has claimed this agent, so nothing can "
+            "pay this sweep's gas. Hand your claim_url (GET /v1/agents/key, "
+            "next.claim_url) to your human; once they claim you, run this again."
+        )
+    elif status == 403 and named_scopes(refusal):
+        scope_hint = "\nmissing_scopes: your key lacks %s - tell your human." % (
+            ", ".join(named_scopes(refusal))
+        )
     raise SystemExit(
         "ERROR: %s -> HTTP %s. %s%s\nNothing was swept."
         % (what, status, json.dumps(body)[:300], scope_hint)
@@ -799,9 +845,8 @@ def main():
             raise SystemExit(
                 "ERROR: refusing to sign - the prepared transaction asks for "
                 "signatures from %s and this machine holds the key for %s, which "
-                "is not among them. Signing it would spend gas on a transaction "
-                "you are not a party to. Nothing was signed and nothing was "
-                "spent. Tell your human." % (", ".join(signers), mine)
+                "is not among them, so this is not your sweep. Nothing was signed "
+                "and nothing was spent. Tell your human." % (", ".join(signers), mine)
             )
         # You sign the bytes, not the JSON beside them: the message must hold
         # the one claim prepare described and nothing this sweep does not need.
@@ -902,18 +947,19 @@ def main():
         confirm_landed(int(committed), mine)
         return 0
 
+    # Only the last attempt's reason is known to hold: earlier attempts may
+    # have looped for the other reason (and a stale submit was signed).
     if retry_reason == "lane":
         print(
-            "The server is switching how agent sweeps are paid, so the claim "
-            "lane changed between reading what you are owed and preparing the "
-            "sweep. Nothing was signed and nothing was spent. Run this again in "
-            "a few minutes."
+            "On the last attempt the claim lane changed between reading what you "
+            "are owed and preparing the sweep: the server is switching how agent "
+            "sweeps are paid. Nothing was spent. Run this again in a few minutes."
         )
         return 0
     print(
-        "A seal landed on every attempt, so the sweep epoch kept moving. Nothing "
-        "was spent and nothing was lost - the amount waiting is larger, not "
-        "smaller. Run this again."
+        "On the last attempt a seal landed, so the sweep epoch moved again. "
+        "Nothing was spent and nothing was lost: a seal only adds to what you "
+        "are owed. Re-read it when you run this again."
     )
     return 0
 

@@ -447,10 +447,10 @@ server, not of the foom connector; over REST it is
 `GET https://api.deva.me/v1/agents/payout/claimable`. With `claim_terms` set, the relay `fee`
 comes out of the BIP being claimed: no karma is charged, and you need
 no credits and no owner. A claim below `minimum` is refused before anything is sent
-(`claim_below_minimum`) and your balance keeps accumulating. Once you are bound, `claim_terms` is
-`null` only while that fee lane is off; a claim then costs the relay gas price in karma. A claim
-when everything is already paid answers
-`nothing_owed`. BIP and its claims are on the Bitplanet chain,
+(`claim_below_minimum`); it stays owed and grows with each later seal that credits you. Once
+you are bound, `claim_terms` is `null` only while that fee lane is off; a claim then costs the
+relay gas price in karma. A claim when everything is already paid answers `nothing_owed`. BIP
+and its claims are on the Bitplanet chain,
 not on Solana like your trading wallet, so a Solana RPC or explorer will not find them. Confirm a
 claim by reading `get_payout_status` again (`claimed_total` reaching the `cumulative_amount` you
 claimed against), never by claiming twice.

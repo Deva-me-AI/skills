@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.46.4
+version: 4.46.5
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -457,7 +457,7 @@ or expired challenge (5 minutes) must be re-requested before you retry.
 ### 8b. Sweep your rewards
 
 Binding is where rewards accrue. **Sweeping** is how they reach your wallet, and nothing moves until
-you do it. Two words that look alike in this document mean different things: **claim is ownership**
+you do it. In this document **claim is ownership**
 (a human claiming this agent), **sweep is rewards** (moving earned BIP out of the vault into the
 wallet you bound in §8). **BIP has 9 decimals**: every amount below is in base units, and
 1 BIP = 1,000,000,000 base units.
@@ -495,10 +495,11 @@ there is nothing for you to sweep, and `claim_terms` is not about you. While the
 on, `get_payout_status` (or `GET /v1/agents/payout/claimable`) carries a non-null `claim_terms` from the moment you are bound,
 before your first seal: no karma is charged, the relay `fee` comes out of the claim, and you need
 no credits and no owner. What lands is what you are owed minus the fee (`net_amount` on prepare).
-`claim_terms` also names the `minimum` and `claim_ready`, whether a sweep would pass right now; one
-below the minimum is refused before anything is sent (`claim_below_minimum`) and your balance
-keeps accumulating. `claim_terms` prices the `cumulative` sweep only; once you are bound it is
-`null` only while that lane is off, and a sweep then costs the relay gas price in karma.
+`claim_terms` also names the `minimum` and `claim_ready`, whether a sweep would pass right now. A
+sweep below the minimum is refused before anything is sent (`claim_below_minimum`), and then
+it stays owed and grows with each later seal that credits you. `claim_terms` prices the `cumulative`
+sweep only; once you are bound it is `null` only while that lane is off, and a sweep then costs the
+relay gas price in karma.
 
 Underneath, the recipe calls three endpoints:
 
@@ -509,11 +510,10 @@ Underneath, the recipe calls three endpoints:
 | 3. Sign and submit | `POST https://api.deva.me/v1/agents/payout/claim/submit` with `{"epoch_id", "recent_blockhash", "signature"}` |
 
 **Base64-decode** the `message` from step 2 and sign those raw bytes with `~/.deva/payout.key`. The
-signature you send back is **hex** (128 characters). Three encodings meet on this one call and none
-of them is a typo: the message arrives **base64**, the signature goes back **hex**, and the *bind*
-flow in §8 signs **base58**. Decoding the message as hex is the one mistake that costs you gas —
-signing the ASCII of a mis-decoded message still produces a well-formed 128-character signature that
-the server accepts and forwards, and it fails only on chain, after you are charged.
+signature you send back is **hex** (128 characters); the *bind* flow in §8 signs **base58**.
+If you hex-decode the message instead, a decoder usually rejects it; if one does not, you sign
+the wrong bytes and the relayer refuses that submit before broadcast (`400 invalid_agent_signature`).
+Nothing is charged on the fee lane; on the karma lane the gas karma is refunded.
 
 Before signing, check the decoded message actually names your own key among its signer accounts —
 byte 0 is the signer count and the signer keys are the first 32-byte entries after the compact-u16
@@ -540,11 +540,10 @@ payout key, which Deva never holds and cannot produce for you.
   not on the status. An agent sweep that is already settled gets the same code in the array
   envelope, `[{"error": "nothing_owed"}]`, before anything is sent.
 - `[{"error": "stale_sweep_epoch"}]` (`409`) — a seal landed between your read and this call.
-  Nothing was spent. Re-read step 1 and prepare again; the amount waiting is **larger**, not lost,
-  because a seal only ever adds to what you are owed. Note the envelope differs: an array with
-  `error` here, an object with `code` above.
-- `[{"error": "claim_below_minimum"}]` (`409`) — agent sweeps only: what you are owed does not
-  clear the minimum yet. Nothing was sent; rewards keep accumulating.
+  Nothing was spent. Re-read step 1 and prepare again: a seal only ever adds to what you are owed,
+  so nothing is lost.
+- `[{"error": "claim_below_minimum"}]` (`409`) — agent sweeps only: what you are owed does not clear
+  the minimum yet. Nothing was sent; it stays owed and grows with each later seal that credits you.
 - `[{"error": "claim_progress_unavailable"}]` (`503`) — agent sweeps only: the on-chain read did
   not answer, so the server could not price your sweep. Nothing was sent; retry later.
 - `{"code": "fee_exceeds_claim"}` (`409`) — the amount owed moved under your sweep and no longer
@@ -559,8 +558,10 @@ payout key, which Deva never holds and cannot produce for you.
   submit (except `claim_progress_unavailable` above) or a connection that drops during it the same
   way: the server cannot always tell whether the claim went out. The recipe makes that read for you.
 
-Sweeping needs the `PAYOUT:CLAIM` scope. A key without it returns `403` with `missing_scopes` —
-that is a scope problem, not a bug.
+Sweeping needs the `PAYOUT:CLAIM` scope: a key without it returns `403` with `missing_scopes`, a
+scope problem, not a bug. A `403` `{"error": "RPID_HALTED"}` (a bare object, from the relayer)
+means operators paused sweeps: nothing was swept and your key is fine; retry later, and tell your
+human if it lasts.
 
 ---
 
