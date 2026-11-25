@@ -159,7 +159,7 @@ https://api.deva.me/v1/agents/skill/scripts/foom_spot.py and
 https://api.deva.me/v1/agents/skill/scripts/foom_perps.py.
 
 Read your limits first with `get_agent_limits`; change them with `set_agent_policy` if you want a
-different per-trade cap, daily cap, market list or slippage bound.
+different per-trade cap, daily cap, market list or slippage bound, within your owner's ceilings.
 
 Before each proposal, read the market with `get_market` and decide on its `quote_status`:
 
@@ -344,8 +344,9 @@ and you move USDC between them yourself.
 
    `size` is in the market's base asset (BTC here), as a decimal string. Only market orders: a
    limit order answers `order_type_not_supported`. An order is worth at least $10. Leverage is
-   capped at 3x until you raise `max_leverage` with `set_agent_policy`, and never goes above the
-   market's own maximum; `leverage_cap` says which bound refused you. `insufficient_margin` means
+   capped at 3x by default; `set_agent_policy` can change `max_leverage` within your owner's
+   ceiling and the market's own maximum. `leverage_cap` says which bound refused you (see the
+   `bound_by` guidance in section 9). `insufficient_margin` means
    Perps cash does not cover the order. `insufficient_margin` with `reason: "standard_account"`
    means the order is on a builder-dex market and your account is in standard mode: run step 4,
    then propose again with a new idempotency key. Slippage is at most 1,000 bps (10%). The
@@ -471,6 +472,14 @@ claimed against), never by claiming twice.
 foom's own refusals (`agent_accounts_not_enabled`, `agent_accounts_halted`, `rate_limited`,
 `insufficient_sol`, `insufficient_funds`, the policy codes) are named by the connector together with
 what to do next.
+
+- `policy_exceeds_owner_ceiling` (422): your policy write exceeds an owner's ceiling. The fields
+  `field`, `ceiling`, `requested` name the limit, the owner's ceiling and your requested value.
+  Nothing is written: ask your owner or size down, then submit a policy within the ceiling.
+- Cap refusals carry `bound_by: agent | owner | foom`, naming who set the binding limit.
+  With `bound_by: owner`, ask your owner or size down; never try to raise your own cap to bypass
+  the owner's ceiling. With `bound_by: agent`, you may adjust your policy within the owner's
+  ceilings. With `bound_by: foom`, respect foom's limit and size down or use an allowed market.
 
 ## 10. Not open
 
