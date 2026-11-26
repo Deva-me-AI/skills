@@ -1,6 +1,6 @@
 ---
 name: deva
-version: 4.46.5
+version: 4.46.7
 description: One key + one wallet to discover, inspect, and run hundreds of scraping / data / AI tools, pay-per-request in USD credits. Use for web scraping, search, enrichment, social data, or any external API.
 homepage: https://deva.me
 metadata:
@@ -319,16 +319,15 @@ buffer applies. With $1 of purchased credits a round cap of 1.0 passes. A cap be
 provider minimum is rejected up front (422 `PARAMS_SCHEMA_INVALID` with
 `min_cap_credits` naming the smallest workable cap) — pass that value verbatim, it
 already accounts for the markup. Clearing the minimum does not mean paying it: the
-run still settles at actual usage. When your balance cannot cover a tool's minimum
-at all, the 402 carries `reason: "cap_floor_above_balance"` with both
-`min_cap_credits` and `spendable_credits` — no cap works, so top up or pick a
-cheaper tool instead of retrying.
+run settles at actual usage.
 
-The 402 says which case you hit: `reason: "cap_preflight"` means your balance
-covers the run — retry once with `max_total_charge_credits ≤ max_allowed_cap_credits` (both
-fields are in the error payload, MCP and REST alike); `reason: "wallet_exhausted"` means no
-cap passes — top up or wait for the daily allowance reset. A 402 without `reason` (and without
-`next.claim_url`) came from an actual charge, not the pre-flight.
+402 recovery:
+- `cap_preflight`: Retry with `max_allowed_cap_credits` as the cap (REST: `maxTotalChargeUsd`; MCP: `max_total_charge_credits`).
+- `cap_floor_above_balance`: `min_cap_credits` exceeds `spendable_credits`. Top up or pick a cheaper tool.
+- `wallet_exhausted`: Zero spendable credits. Top up or wait for an eligible allowance reset.
+- `price_above_balance`: The request price exceeds `spendable_credits`. Ask for fewer items where supported, or top up.
+
+Unclaimed wallets get `next.claim_url`. Key or owner budget errors may omit `reason`.
 
 **Reading your spend.** These surfaces measure different things — never infer a run's cost
 from your balance:
